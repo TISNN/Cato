@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "cato-ai-content-workbench": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CODEBUDDY_PLUGIN_ROOT}/server.mjs"],
+      "env": {
+        "CATO_API_TOKEN": "${CATO_API_TOKEN}",
+        "CATO_API_URL": "${CATO_API_URL}"
+      },
+      "timeout": 30000
+    }
+  }
+}

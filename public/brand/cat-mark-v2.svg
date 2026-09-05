@@ -1,0 +1,7 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Minimal cat app mark</title>
+  <rect x="24" y="24" width="208" height="208" rx="56" fill="#A98CFF"/>
+  <path d="M65 151C65 132 69 116 75 101L87 66C90 57 97 56 102 66L113 91C116 99 140 99 143 91L154 66C159 56 166 57 169 66L181 101C187 117 191 133 191 151C191 180 168 195 128 195C88 195 65 180 65 151Z" fill="#181927"/>
+  <ellipse cx="104" cy="132" rx="10" ry="16" fill="#F7F8FF"/>
+  <ellipse cx="152" cy="132" rx="10" ry="16" fill="#F7F8FF"/>
+</svg>

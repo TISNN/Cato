@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/**
+!data/.gitkeep
+.DS_Store
+integrations/MediaCrawler/
+integrations/**/.env
+integrations/**/.venv/
+integrations/**/browser_data/

@@ -1,0 +1,25 @@
+{
+  "name": "Cato AI",
+  "name_zh": "Cato AI 内容工作台",
+  "name_en": "Cato AI Content Workbench",
+  "description": "在 WorkBuddy 中检索 Cato 资料与内容情报，并在确认后记录灵感或创建内容项目。",
+  "description_zh": "在 WorkBuddy 中检索 Cato 资料与内容情报，并在确认后记录灵感或创建内容项目。",
+  "description_en": "Search Cato knowledge and intelligence, then capture ideas or create content projects after confirmation.",
+  "source": "cato-ai-content-workbench",
+  "type": "mcp",
+  "version": "0.1.0",
+  "minWorkbuddyVersion": "4.24.0",
+  "auth_mode": "token",
+  "examples_zh": [
+    "搜索资料库中关于小红书选题的内容",
+    "查找最近的抖音内容情报",
+    "把这条想法记录到 Cato 灵感收件箱",
+    "确认后创建一个小红书图文项目"
+  ],
+  "examples_en": [
+    "Search Cato knowledge about Xiaohongshu topics",
+    "Find recent Douyin intelligence in Cato",
+    "Capture this idea in the Cato inbox",
+    "Create a Xiaohongshu post project after confirmation"
+  ]
+}

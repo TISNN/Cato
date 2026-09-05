@@ -1,0 +1,28 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    font-family: 'DM Sans', 'Noto Sans SC', 'PingFang SC', system-ui, sans-serif;
+    color: #171720;
+    background: #f7f7fa;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  * { box-sizing: border-box; }
+  html, body, #root { min-height: 100%; margin: 0; }
+  body { min-width: 320px; }
+  button, input { font: inherit; }
+}
+
+@layer utilities {
+  .login-photo-overlay {
+    background:
+      linear-gradient(180deg, rgba(9, 10, 15, 0.18) 0%, rgba(9, 10, 15, 0.07) 38%, rgba(9, 10, 15, 0.75) 100%),
+      linear-gradient(90deg, rgba(9, 10, 15, 0.48) 0%, transparent 58%);
+  }
+}

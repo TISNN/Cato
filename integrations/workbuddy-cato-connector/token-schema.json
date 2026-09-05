@@ -1,0 +1,26 @@
+{
+  "title": "连接本机 Cato AI",
+  "title_en": "Connect local Cato AI",
+  "description": "令牌仅保存在本机 WorkBuddy，Cato 数据库不会保存明文令牌。请先在 Cato 的 WorkBuddy 连接页生成令牌。",
+  "description_en": "The token is stored locally by WorkBuddy. Generate it first from Cato's WorkBuddy connection page.",
+  "fields": [
+    {
+      "key": "CATO_API_TOKEN",
+      "label": "Cato 连接令牌",
+      "label_en": "Cato connection token",
+      "type": "password",
+      "required": true,
+      "placeholder": "在 Cato 中生成并复制",
+      "description": "用于访问当前本机工作区的数据。重新生成令牌会使旧连接失效。"
+    },
+    {
+      "key": "CATO_API_URL",
+      "label": "Cato 本地地址",
+      "label_en": "Cato local URL",
+      "type": "text",
+      "required": true,
+      "defaultValue": "http://127.0.0.1:5173",
+      "description": "Cato 服务必须在同一台电脑上运行。"
+    }
+  ]
+}
