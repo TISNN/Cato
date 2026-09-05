@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始">开始使用</a> · <a href="#已包含的功能">功能</a> · <a href="#workbuddy-接入">WorkBuddy</a> · <a href="#架构">架构</a>
+  <a href="#快速开始">开始使用</a> · <a href="#已包含的功能">功能</a> · <a href="#workbuddy-接入">WorkBuddy</a> · <a href="#架构">架构</a> · <a href="./docs/REFERENCE_PROJECTS.md">参考项目</a>
 </p>
 
 ## 为什么是 Cato
