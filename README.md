@@ -16,10 +16,6 @@
   <a href="#快速开始">开始使用</a> · <a href="#已包含的功能">功能</a> · <a href="#workbuddy-接入">WorkBuddy</a> · <a href="#架构">架构</a>
 </p>
 
-<p align="center">
-  <img src="./public/readme/cato-hero-v1.png" width="100%" alt="Cato AI 内容工作台封面：冷白工作台、浅紫内容卡片和猫咪品牌形象" />
-</p>
-
 ## 为什么是 Cato
 
 内容运营的麻烦不在于少一个生成器，而在于素材、灵感、选题、稿件和复盘分散在不同工具里，最后很难回答两件事：现在应该推进什么，以及这条内容为什么值得做。
