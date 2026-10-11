@@ -7,3 +7,4 @@ integrations/MediaCrawler/
 integrations/**/.env
 integrations/**/.venv/
 integrations/**/browser_data/
+.tools/

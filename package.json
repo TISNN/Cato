@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "node server.mjs --dev",
     "build": "tsc -b && vite build",
-    "preview": "node server.mjs"
+    "preview": "node server.mjs",
+    "transcript": "node transcript/cli.mjs",
+    "transcript:status": "node transcript/cli.mjs status",
+    "transcript:setup": "node transcript/cli.mjs setup",
+    "transcript:test": "node transcript/test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

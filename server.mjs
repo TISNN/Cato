@@ -8,10 +8,24 @@ import {
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { basename, extname, join, normalize } from "node:path";
+import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createServer as createViteServer } from "vite";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  detectPlatform,
+  downloadWhisperModel,
+  extractTranscriptFromUrl,
+  extractUrl as extractSharedUrl,
+  getSetupState,
+  probeCapabilities,
+  setupTranscriptEngine,
+  transcribeMediaUrl,
+} from "./transcript/index.mjs";
 
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
 const isDevelopment = process.argv.includes("--dev");
@@ -90,6 +104,19 @@ db.exec(`
     metric_comments INTEGER NOT NULL DEFAULT 0,
     metric_saves INTEGER NOT NULL DEFAULT 0,
     metrics_recorded_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS creator_accounts (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    handle TEXT NOT NULL DEFAULT '',
+    content_focus TEXT NOT NULL DEFAULT '',
+    audience TEXT NOT NULL DEFAULT '',
+    tone TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
+    notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -505,6 +532,11 @@ function authStatus(request) {
   return { setupRequired: !hasUsers, user: getSession(request) };
 }
 
+function getSessionTokenHash(request) {
+  const token = parseCookies(request.headers.cookie)[sessionCookieName];
+  return token ? hashSessionToken(token) : "";
+}
+
 function getWorkBuddyToken(request) {
   const authorization = request.headers.authorization || "";
   const bearer = authorization.match(/^Bearer\s+(.+)$/iu)?.[1]?.trim();
@@ -543,6 +575,42 @@ function getWorkBuddyStatus(userId) {
     createdAt: token?.createdAt || null,
     lastUsedAt: token?.lastUsedAt || null,
     apiUrl: `http://127.0.0.1:${port}`,
+    mcpEndpoint: `http://127.0.0.1:${port}/mcp`,
+    mcpServerName: "cato-ai-content-workbench",
+  };
+}
+
+function getWorkBuddyDiscovery(userId) {
+  const token = db
+    .prepare(
+      "SELECT token_hash FROM workspace_api_tokens WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    )
+    .get(userId);
+  // 返回最新可用 token 的 SHA256 哈希 + 元数据；agent 需要把这个 token 写入 ~/.workbuddy/mcp.json。
+  // 原始 token 仅在生成时返回一次；discovery 接口不返回原始值，agent 必须通过 /api/workbuddy/token 拿到。
+  return {
+    mcpServerName: "cato-ai-content-workbench",
+    apiUrl: `http://127.0.0.1:${port}`,
+    mcpEndpoint: `http://127.0.0.1:${port}/mcp`,
+    configPath: join(homedir(), ".workbuddy", "mcp.json"),
+    hasActiveToken: Boolean(token),
+    reissueInstructions: [
+      "如果 hasActiveToken 为 false，请提示用户在 Cato 端点击「连接 WorkBuddy」并按「生成新的令牌」。",
+      "然后用获取到的原始 token 写入 ~/.workbuddy/mcp.json（见下文）。",
+      "本 discovery 接口只暴露服务端元数据，不返回原始 token，避免 token 在日志或对话里泄漏。",
+    ],
+    configTemplate: {
+      mcpServers: {
+        "cato-ai-content-workbench": {
+          url: `http://127.0.0.1:${port}/mcp`,
+          type: "streamable-http",
+          headers: {
+            Authorization: "Bearer <token>",
+          },
+          timeout: 30000,
+        },
+      },
+    },
   };
 }
 
@@ -624,6 +692,58 @@ function listInboxNotes() {
         return { ...note, tags: [], topicId: note.topicId || null };
       }
     });
+}
+
+function listCreatorAccounts() {
+  return db
+    .prepare(
+      "SELECT id, platform, display_name AS displayName, handle, content_focus AS contentFocus, audience, tone, status, notes, created_at AS createdAt, updated_at AS updatedAt FROM creator_accounts ORDER BY updated_at DESC, id DESC",
+    )
+    .all();
+}
+
+function getCreatorAccount(accountId) {
+  return (
+    db
+      .prepare(
+        "SELECT id, platform, display_name AS displayName, handle, content_focus AS contentFocus, audience, tone, status, notes, created_at AS createdAt, updated_at AS updatedAt FROM creator_accounts WHERE id = ?",
+      )
+      .get(accountId) || null
+  );
+}
+
+function normalizeCreatorAccountDraft(body) {
+  const platform = firstValue(body.platform);
+  const displayName = firstValue(body.displayName);
+  const handle = firstValue(body.handle);
+  const contentFocus = firstValue(body.contentFocus);
+  const audience = firstValue(body.audience);
+  const tone = firstValue(body.tone);
+  const notes = firstValue(body.notes);
+  const status = firstValue(body.status) || "active";
+  if (!platformSet.has(platform)) return { error: "平台无效。" };
+  if (!displayName || displayName.length > 80)
+    return { error: "请输入 1 至 80 个字符的账号名称。" };
+  if (handle.length > 120) return { error: "账号 ID 不能超过 120 个字符。" };
+  if (contentFocus.length > 200)
+    return { error: "内容方向不能超过 200 个字符。" };
+  if (audience.length > 200) return { error: "目标受众不能超过 200 个字符。" };
+  if (tone.length > 120) return { error: "账号语气不能超过 120 个字符。" };
+  if (!["active", "paused"].includes(status))
+    return { error: "账号状态无效。" };
+  if (notes.length > 2_000) return { error: "备注不能超过 2,000 个字符。" };
+  return {
+    account: {
+      platform,
+      displayName,
+      handle,
+      contentFocus,
+      audience,
+      tone,
+      status,
+      notes,
+    },
+  };
 }
 
 const knowledgeDocumentSelect =
@@ -807,6 +927,483 @@ function getProject(projectId) {
   return db.prepare(`${projectSelect} WHERE p.id = ?`).get(projectId);
 }
 
+const MCP_INSTRUCTIONS = `在 Cato 内容工作台中检索资料和情报，并在得到用户明确确认后记录灵感或创建创作项目。
+
+先用 cato_search_library 或 cato_search_intelligence 检索依据；需要完整正文时再用 cato_read_library_document。
+
+cato_capture_inbox_note、cato_create_content_project 和 cato_extract_video_transcript 是写入工具：必须先向用户展示要写入的内容并取得明确确认，只有确认后才传 confirmed: true。"记一下"或"创建一个"以外的模糊意图不应视为确认。
+
+cato_extract_video_transcript 会真的去解析链接并可能执行语音识别，耗时不确定；调用前先说明会写入一条内容情报。若返回缺少引擎，不要重试，直接把安装提示转达给用户。
+
+创建项目时平台只能选 小红书 / 公众号 / 抖音；若关联选题 ID，对应选题必须已确认，不要自行创建或确认选题。
+
+令牌失效或无法连接时，提示用户打开本机 Cato 的"连接 WorkBuddy"重新生成令牌，并把新令牌粘贴到连接器表单里——不要把令牌贴到对话中。`.trim();
+
+function mcpErrorResult(message) {
+  return {
+    content: [{ type: "text", text: message }],
+    isError: true,
+  };
+}
+
+function mcpJsonResult(payload) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+function createCatoMcpServer() {
+  const server = new McpServer(
+    { name: "cato-ai-content-workbench", version: "0.1.0" },
+    {
+      capabilities: { tools: {} },
+      instructions: MCP_INSTRUCTIONS,
+    },
+  );
+
+  server.registerTool(
+    "cato_search_library",
+    {
+      title: "搜索 Cato 资料库",
+      description:
+        "按标题、正文、分类和标签搜索 Cato 资料库，返回匹配结果与正文摘录。",
+      inputSchema: {
+        query: z
+          .string()
+          .optional()
+          .describe("检索词；留空返回最近资料。"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query }) => {
+      const needle = (query || "").trim().slice(0, 120).toLocaleLowerCase();
+      const documents = listKnowledgeDocuments()
+        .filter((document) =>
+          !needle ||
+          `${document.title}\n${document.body}\n${document.category}\n${document.tags.join(" ")}`
+            .toLocaleLowerCase()
+            .includes(needle),
+        )
+        .slice(0, 12)
+        .map(({ id, title, body, category, tags, version, updatedAt }) => ({
+          id,
+          title,
+          excerpt: body.slice(0, 1_200),
+          category,
+          tags,
+          version,
+          updatedAt,
+        }));
+      return mcpJsonResult({ documents });
+    },
+  );
+
+  server.registerTool(
+    "cato_read_library_document",
+    {
+      title: "读取 Cato 资料",
+      description: "读取一份资料库文档的完整正文。先用 cato_search_library 获取 documentId。",
+      inputSchema: {
+        documentId: z.string().describe("资料 ID。"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ documentId }) => {
+      const document = getKnowledgeDocument(documentId);
+      if (!document || document.archivedAt)
+        return mcpErrorResult("资料不存在。");
+      return mcpJsonResult({
+        document: { ...document, body: document.body.slice(0, 50_000) },
+      });
+    },
+  );
+
+  server.registerTool(
+    "cato_search_intelligence",
+    {
+      title: "搜索 Cato 内容情报",
+      description: "搜索已采集的内容情报；可按小红书、公众号或抖音筛选。",
+      inputSchema: {
+        query: z
+          .string()
+          .optional()
+          .describe("检索词；留空返回最新情报。"),
+        platform: z
+          .enum(["小红书", "公众号", "抖音"])
+          .optional()
+          .describe("可选平台。"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, platform }) => {
+      if (platform && !platformSet.has(platform))
+        return mcpErrorResult("采集平台无效。");
+      const needle = (query || "").trim().slice(0, 120).toLocaleLowerCase();
+      const evidence = db
+        .prepare(
+          "SELECT id, title, summary, body, platform, author, signal, collected_at AS collectedAt, source_url AS sourceUrl, cover_url AS coverUrl, video_url AS videoUrl, transcript, transcript_status AS transcriptStatus FROM evidence_items WHERE archived_at = '' ORDER BY created_at DESC, id DESC",
+        )
+        .all()
+        .filter(
+          (item) =>
+            (!platform || item.platform === platform) &&
+            (!needle ||
+              `${item.title}\n${item.summary}\n${item.body}\n${item.author}\n${item.signal}`
+                .toLocaleLowerCase()
+                .includes(needle)),
+        )
+        .slice(0, 20)
+        .map((item) => ({
+          ...item,
+          body: item.body.slice(0, 4_000),
+          transcript: item.transcript.slice(0, 4_000),
+        }));
+      return mcpJsonResult({ evidence });
+    },
+  );
+
+  server.registerTool(
+    "cato_capture_inbox_note",
+    {
+      title: "记录到 Cato 灵感收件箱",
+      description:
+        "将一条灵感写入 Cato 收件箱。必须先取得用户确认，再传 confirmed: true。",
+      inputSchema: {
+        body: z.string().describe("灵感正文。"),
+        tags: z.array(z.string()).optional().describe("可选标签。"),
+        confirmed: z
+          .boolean()
+          .describe("仅在用户明确确认写入后设为 true。"),
+      },
+    },
+    async (args) => {
+      if (args.confirmed !== true)
+        return mcpErrorResult(
+          "请在调用前取得用户确认，并传入 confirmed: true。",
+        );
+      const noteBody = firstValue(args.body);
+      const tags = normalizeInboxTags(args.tags);
+      if (!noteBody || noteBody.length > 10_000)
+        return mcpErrorResult(
+          "灵感内容不能为空，且不能超过 10,000 个字符。",
+        );
+      const createdAt = now();
+      const note = {
+        id: crypto.randomUUID(),
+        body: noteBody,
+        tags,
+        topicId: null,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      db.prepare(
+        "INSERT INTO inbox_notes (id, body, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      ).run(note.id, note.body, JSON.stringify(note.tags), createdAt, createdAt);
+      return mcpJsonResult({ note });
+    },
+  );
+
+  server.registerTool(
+    "cato_list_content_projects",
+    {
+      title: "列出 Cato 创作项目",
+      description: "读取 Cato 的创作项目及其审核、发布状态。",
+      inputSchema: {
+        reviewStatus: z
+          .enum(["草稿", "待审核", "已批准"])
+          .optional()
+          .describe("可选审核状态。"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ reviewStatus }) => {
+      if (reviewStatus && !reviewStatusSet.has(reviewStatus))
+        return mcpErrorResult("审核状态无效。");
+      const projects = db
+        .prepare(`${projectSelect} ORDER BY p.updated_at DESC`)
+        .all()
+        .filter(
+          (project) => !reviewStatus || project.reviewStatus === reviewStatus,
+        )
+        .slice(0, 50);
+      return mcpJsonResult({ projects });
+    },
+  );
+
+  server.registerTool(
+    "cato_create_content_project",
+    {
+      title: "创建 Cato 创作项目",
+      description:
+        "在 Cato 创建一份草稿项目。必须先向用户展示关键信息并取得确认。",
+      inputSchema: {
+        title: z.string().describe("稿件标题。"),
+        platform: z
+          .enum(["小红书", "公众号", "抖音"])
+          .describe("目标平台。"),
+        contentFormat: z
+          .enum(["图文笔记", "长文文章", "短视频脚本", "口播稿"])
+          .optional()
+          .describe("内容形式，默认图文笔记。"),
+        topicId: z
+          .string()
+          .optional()
+          .describe("可选，已确认选题的 ID。"),
+        body: z.string().optional().describe("可选，初始正文。"),
+        confirmed: z
+          .boolean()
+          .describe("仅在用户明确确认创建后设为 true。"),
+      },
+    },
+    async (args) => {
+      if (args.confirmed !== true)
+        return mcpErrorResult(
+          "请在调用前取得用户确认，并传入 confirmed: true。",
+        );
+      const title = firstValue(args.title);
+      const platform = firstValue(args.platform);
+      const contentFormat = firstValue(args.contentFormat) || "图文笔记";
+      const topicId = firstValue(args.topicId) || null;
+      const content = typeof args.body === "string" ? args.body : "";
+      if (
+        !title ||
+        !platformSet.has(platform) ||
+        !contentFormatSet.has(contentFormat)
+      )
+        return mcpErrorResult("稿件标题、目标平台或内容格式无效。");
+      if (content.length > 60 * 1024)
+        return mcpErrorResult("正文不能超过 60,000 个字符。");
+      const topic = topicId
+        ? db.prepare("SELECT id, status FROM topics WHERE id = ?").get(topicId)
+        : null;
+      if (topicId && !topic) return mcpErrorResult("选题不存在。");
+      if (topic && topic.status !== "已确认")
+        return mcpErrorResult("请先确认选题，再创建稿件。");
+      const createdAt = now();
+      const project = {
+        id: crypto.randomUUID(),
+        title,
+        platform,
+        contentFormat,
+        topicId,
+        status: "草稿",
+        reviewStatus: "草稿",
+        reviewNote: "",
+        body: content,
+        version: 1,
+        updatedAt: createdAt,
+      };
+      db.prepare(
+        "INSERT INTO content_projects (id, title, platform, content_format, topic_id, status, body, version, created_at, updated_at, review_status, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        project.id,
+        project.title,
+        project.platform,
+        project.contentFormat,
+        project.topicId,
+        project.status,
+        project.body,
+        project.version,
+        createdAt,
+        project.updatedAt,
+        project.reviewStatus,
+        project.reviewNote,
+      );
+      return mcpJsonResult({ project: getProject(project.id) });
+    },
+  );
+
+  server.registerTool(
+    "cato_extract_video_transcript",
+    {
+      title: "从视频链接提取文案",
+      description:
+        "解析一个视频链接，优先抓取平台原生字幕、无字幕时才做语音识别，把可编辑的口播文案存入 Cato 内容情报。必须先向用户展示该链接并取得确认。",
+      inputSchema: {
+        url: z.string().describe("视频分享链接。"),
+        confirmed: z
+          .boolean()
+          .describe("仅在用户明确确认从该链接导入后设为 true。"),
+      },
+    },
+    async ({ url, confirmed }) => {
+      if (confirmed !== true)
+        return mcpErrorResult(
+          "请先向用户展示将要导入的链接并取得确认，再传入 confirmed: true。",
+        );
+      const sourceUrl = extractSharedUrl(url);
+      if (!sourceUrl)
+        return mcpErrorResult("请提供以 http(s) 开头的视频链接。");
+      const capabilities = await probeCapabilities({ rootDir });
+      const outcome = await extractTranscriptFromUrl({
+        url: sourceUrl,
+        capabilities,
+      });
+      const saved = saveEvidenceFromUrlOutcome({ sourceUrl, outcome });
+      if (!saved)
+        return mcpErrorResult(
+          `${outcome.error || "未能从该链接提取文案。"}${outcome.hint ? ` ${outcome.hint}` : ""}`,
+        );
+      return mcpJsonResult({
+        item: {
+          id: saved.item.id,
+          title: saved.item.title,
+          platform: saved.item.platform,
+          author: saved.item.author,
+          sourceUrl: saved.item.sourceUrl,
+        },
+        created: saved.created,
+        transcriptChars: Array.from(saved.item.transcript || "").length,
+        note:
+          outcome.status === "succeeded"
+            ? "文案已提取并写入内容情报。"
+            : "已写入内容情报，但未能提取文案。",
+      });
+    },
+  );
+
+  return server;
+}
+
+const WORKBUDDY_INSTALL_GUIDE = `# Connect WorkBuddy to Cato (this local workspace)
+
+This page is a machine-installable contract. Follow these steps in order and stop only when verification passes.
+
+You are complete only when:
+
+1. Cato's MCP server entry has been merged into the user's local WorkBuddy MCP config.
+2. WorkBuddy has reloaded its MCP config.
+3. A successful round-trip to the \`cato_search_library\` tool has been confirmed.
+
+If a concrete blocker remains, report the exact failed step and the single user action needed to continue.
+
+## Operating rules
+
+- Treat the Cato API token as a secret. Do not echo it, do not log it, do not commit it. Do not send it to the user in chat after they have pasted it.
+- Do not edit any Cato server file. Cato is the owner of its workspace data.
+- Preserve every other MCP server the user has already configured. Only merge the Cato entry.
+- If \`/reload-plugins\` does not exist in this WorkBuddy client, tell the user to quit and reopen WorkBuddy, then continue.
+
+## 1. Find the Cato token in this conversation
+
+The user just clicked **复制并打开 WorkBuddy** in Cato's UI. The clipboard / this chat already contains the token in the form:
+
+\`\`\`
+cato_<base64url-string>
+\`\`\`
+
+Locate the token either by:
+
+- Looking for a string that matches the pattern \`^cato_[A-Za-z0-9_-]{16,}$\`, OR
+- The user will paste it as a follow-up. If neither is present, ask the user to press **复制并打开 WorkBuddy** in Cato's connection panel.
+
+## 2. Merge into \`~/.workbuddy/mcp.json\`
+
+The config file is at \`~/.workbuddy/mcp.json\`. Read it if it exists, then merge this entry under \`mcpServers\`:
+
+\`\`\`json
+{
+  "mcpServers": {
+    "cato-ai-content-workbench": {
+      "url": "http://127.0.0.1:5173/mcp",
+      "type": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer <paste the cato_ token from step 1 here>"
+      },
+      "timeout": 30000
+    }
+  }
+}
+\`\`\`
+
+Use \`Edit\` / \`Write\` tools to keep every other \`mcpServers\` entry untouched. After writing, verify the JSON parses with \`python3 -c 'import json; json.load(open("'"'"'~/.workbuddy/mcp.json'"'"'))'\`.
+
+## 3. Reload WorkBuddy
+
+Type \`/reload-plugins\` in this same chat to make WorkBuddy re-read \`~/.workbuddy/mcp.json\`. If the command does not exist in this client, instruct the user to quit and reopen WorkBuddy, then return to this chat.
+
+## 4. Verify
+
+Call the Cato MCP tool \`cato_search_library\` with no arguments. The expected response is a JSON object that contains a \`results\` array (possibly \`[]\`) plus \`total\`. A successful read-back from \`http://127.0.0.1:5173/mcp\` proves the MCP connection.
+
+If \`cato_search_library\` returns a 401 or "missing token" error, the token was not merged correctly. Re-run step 2 and check the file contents.
+
+If \`cato_search_library\` returns a connection error, Cato is not running. Ask the user to start Cato (the browser tab at \`http://127.0.0.1:5173\` is the same process) and re-verify.
+
+## 5. Report back
+
+Tell the user only:
+
+- Whether the connection verified.
+- That any new Cato token invalidates the old one and they will need to repeat step 1-3 if they regenerate it in Cato.
+- Where to manage the connector in WorkBuddy (连接器 → 自定义连接器 → 配置 MCP).
+
+Do not display the token, the config file contents, or any internal state.
+
+## Human documentation
+
+- WorkBuddy setup: open Cato, click 左下角 **连接 WorkBuddy**, press **复制并打开 WorkBuddy**.
+- Cato server restart: stop the current \`node server.mjs\` process and start it again.
+`;
+
+const WORKBUDDY_INSTALL_PROMPT = `请按以下步骤把 Cato MCP 连到你的 WorkBuddy：
+
+1. 读取 https://127.0.0.1:5173/workbuddy 完整安装契约
+2. 在对话中找到 cato_ 开头的 Cato 令牌（用户在 Cato 连接面板点了「复制并打开 WorkBuddy」后会自动贴在 prompt 里）
+3. 按契约把 Cato MCP 写入 ~/.workbuddy/mcp.json
+4. 运行 /reload-plugins 重载
+5. 调一次 cato_search_library（不传参数）自检，并把结果贴回来`;
+
+function buildWorkBuddyDeepLink() {
+  return `workbuddy://task?action=start&prompt=${encodeURIComponent(WORKBUDDY_INSTALL_PROMPT)}`;
+}
+
+function buildWorkBuddyDeepLinkWithToken(token) {
+  const prompt = `${WORKBUDDY_INSTALL_PROMPT}
+
+Cato 令牌：${token}`;
+  return `workbuddy://task?action=start&prompt=${encodeURIComponent(prompt)}`;
+}
+
+function serveWorkBuddyInstallGuide(response) {
+  sendText(
+    response,
+    200,
+    "text/markdown; charset=utf-8",
+    WORKBUDDY_INSTALL_GUIDE,
+  );
+}
+
+async function handleMcpRequest(request, response) {
+  const tokenRecord = getWorkBuddyToken(request);
+  if (!tokenRecord) {
+    sendJson(response, 401, {
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "请提供 Cato 连接令牌。" },
+    });
+    return;
+  }
+  const mcp = createCatoMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(request, response);
+  } catch (error) {
+    if (!response.headersSent) {
+      console.error("[mcp] handler error:", error);
+      sendJson(response, 500, { error: "MCP handler failed." });
+    }
+  } finally {
+    try {
+      await transport.close();
+    } catch {
+      // ignore close errors after response is sent
+    }
+  }
+}
+
 const crawlerPlatformLabel = {
   xhs: "小红书",
   dy: "抖音",
@@ -816,6 +1413,171 @@ const crawlerPlatformLabel = {
   tieba: "贴吧",
   zhihu: "知乎",
 };
+
+/** 转写引擎识别出的平台 → 情报里保存的平台标签（与 crawlerPlatformLabel 风格保持一致）。 */
+const transcriptPlatformLabel = {
+  抖音: "抖音",
+  小红书: "小红书",
+  哔哩哔哩: "B站",
+  视频号: "视频号",
+  快手: "快手",
+  YouTube: "YouTube",
+  其他: "其他",
+};
+
+/** yt-dlp 覆盖不到的平台：只能对采集到的媒体直链做语音转写。 */
+const asrOnlyPlatforms = new Set(["抖音", "快手", "视频号"]);
+
+/** 引擎状态 → evidence_items.transcript_status。unsupported 归入 failed，避免被误读为「引擎没配」。 */
+function transcriptStatusFor(outcome) {
+  if (outcome.status === "succeeded") return "succeeded";
+  if (outcome.status === "not_configured") return "not_configured";
+  return "failed";
+}
+
+/**
+ * 为一条情报选定提取路径。
+ * 抖音这类 yt-dlp 不覆盖的平台，即使有分享链接也要走采集到的媒体直链做 ASR，
+ * 否则会拿到 unsupported 而白白浪费一次可用的视频地址。
+ */
+async function resolveTranscriptForEvidence(item, capabilities) {
+  const shareUrl = firstValue(item.sourceUrl);
+  const mediaUrl = firstValue(item.videoUrl);
+  const platform = detectPlatform(shareUrl);
+  if (asrOnlyPlatforms.has(platform) && mediaUrl)
+    return transcribeMediaUrl({ mediaUrl, capabilities });
+  if (shareUrl) return extractTranscriptFromUrl({ url: shareUrl, capabilities });
+  if (mediaUrl) return transcribeMediaUrl({ mediaUrl, capabilities });
+  return {
+    status: "failed",
+    text: "",
+    source: "",
+    error: "该情报没有可用于提取文案的链接。",
+    hint: "补一个来源链接，或改用「抖音单条链接」采集。",
+    stages: [],
+  };
+}
+
+/** 把一次提取结果写回情报。succeeded 才写 text，其余情况保持空串。 */
+function applyTranscriptOutcome(evidenceId, outcome) {
+  const text = outcome.status === "succeeded" ? String(outcome.text || "") : "";
+  db.prepare(
+    "UPDATE evidence_items SET transcript = ?, transcript_status = ? WHERE id = ?",
+  ).run(text, transcriptStatusFor(outcome), evidenceId);
+  return text;
+}
+
+const evidenceDetailSelect =
+  "SELECT id, title, summary, body, platform, author, signal, collected_at AS collectedAt, source_url AS sourceUrl, cover_url AS coverUrl, image_urls AS imageUrls, video_url AS videoUrl, transcript, transcript_status AS transcriptStatus, archived_at AS archivedAt FROM evidence_items WHERE id = ?";
+
+/** 转写结果的可审计摘要，路由与 MCP 工具共用同一种结构。 */
+function summarizeTranscriptOutcome(outcome, text = "") {
+  return {
+    status: outcome.status,
+    source: outcome.source || "",
+    chars: Array.from(String(text || "")).length,
+    language: outcome.language || "",
+    stages: outcome.stages || [],
+    error: outcome.error || "",
+    hint: outcome.hint || "",
+  };
+}
+
+/**
+ * 把一次链接提取的结果落成内容情报。同链接走更新，避免同一素材刷出多条。
+ * 返回 null 表示既没拿到转写、也没解析出元数据——调用方必须据此拒绝落库，
+ * 否则会给情报列表塞进一条只有链接的空壳。
+ */
+function saveEvidenceFromUrlOutcome({ sourceUrl, outcome }) {
+  const metadata = outcome.metadata || {};
+  const title = firstValue(metadata.title);
+  const transcript =
+    outcome.status === "succeeded" ? String(outcome.text || "") : "";
+  if (outcome.status !== "succeeded" && !title) return null;
+
+  const detected = firstValue(metadata.platform) || detectPlatform(sourceUrl);
+  const platform = transcriptPlatformLabel[detected] || detected || "其他";
+  const description = String(metadata.description || "").trim();
+  const author = firstValue(metadata.author).slice(0, 80) || "链接导入（未取得作者）";
+  const signal = metadata.durationSeconds
+    ? `时长 ${Math.round(metadata.durationSeconds)} 秒`
+    : "链接导入";
+  const collectedAt = new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date());
+  const values = [
+    (title || "未命名视频").slice(0, 180),
+    (description || title).slice(0, 2_000),
+    description || title,
+    platform,
+    author,
+    signal,
+    collectedAt,
+  ];
+  const existing = db
+    .prepare(
+      "SELECT id FROM evidence_items WHERE source_url = ? AND archived_at = '' LIMIT 1",
+    )
+    .get(sourceUrl);
+  const evidenceId = existing?.id || crypto.randomUUID();
+  if (existing) {
+    db.prepare(
+      "UPDATE evidence_items SET title = ?, summary = ?, body = ?, platform = ?, author = ?, signal = ?, collected_at = ?, cover_url = ?, transcript = ?, transcript_status = ? WHERE id = ?",
+    ).run(
+      ...values,
+      String(metadata.thumbnail || "").slice(0, 2_000),
+      transcript,
+      transcriptStatusFor(outcome),
+      evidenceId,
+    );
+  } else {
+    db.prepare(
+      "INSERT INTO evidence_items (id, title, summary, body, platform, author, signal, collected_at, source_url, cover_url, image_urls, video_url, transcript, transcript_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      evidenceId,
+      ...values,
+      sourceUrl.slice(0, 2_000),
+      String(metadata.thumbnail || "").slice(0, 2_000),
+      "[]",
+      "",
+      transcript,
+      transcriptStatusFor(outcome),
+      now(),
+    );
+  }
+  const saved = db.prepare(evidenceDetailSelect).get(evidenceId);
+  return {
+    item: { ...saved, archivedAt: saved.archivedAt || null, imageUrls: [] },
+    created: !existing,
+  };
+}
+
+/** MediaCrawler 采集完成后的转写钩子：对本次采集导入的每条情报逐条提取。 */
+async function runTranscriptForCrawlRun(runId) {
+  const items = db
+    .prepare(
+      "SELECT id, title, source_url AS sourceUrl, video_url AS videoUrl FROM evidence_items WHERE crawl_run_id = ?",
+    )
+    .all(runId);
+  if (!items.length) return "not_requested";
+  const capabilities = await probeCapabilities({ rootDir });
+  let succeeded = 0;
+  let configured = 0;
+  for (const item of items) {
+    const outcome = await resolveTranscriptForEvidence(item, capabilities);
+    const status = transcriptStatusFor(outcome);
+    applyTranscriptOutcome(item.id, outcome);
+    if (status === "succeeded") succeeded += 1;
+    if (status === "not_configured") configured += 1;
+  }
+  if (succeeded) return "succeeded";
+  if (configured) return "not_configured";
+  return "failed";
+}
 
 async function hasFile(filePath) {
   try {
@@ -1231,6 +1993,7 @@ async function startMediaCrawlerRun({
     if (finalized) return;
     finalized = true;
     activeCrawlerProcesses.delete(id);
+    let transcriptStatus = "not_requested";
     try {
       const importedCount = errorMessage
         ? 0
@@ -1240,24 +2003,24 @@ async function startMediaCrawlerRun({
           ? 0
           : await importMediaCrawlerComments({ id, platform, outputPath });
       if (!errorMessage && requestTranscript)
-        db.prepare(
-          "UPDATE evidence_items SET transcript_status = 'not_configured' WHERE crawl_run_id = ?",
-        ).run(id);
+        transcriptStatus = await runTranscriptForCrawlRun(id);
       db.prepare(
-        "UPDATE crawler_runs SET status = ?, imported_count = ?, imported_comments = ?, error_message = ?, completed_at = ? WHERE id = ?",
+        "UPDATE crawler_runs SET status = ?, imported_count = ?, imported_comments = ?, transcript_status = ?, error_message = ?, completed_at = ? WHERE id = ?",
       ).run(
         errorMessage ? "failed" : "succeeded",
         importedCount,
         importedComments,
+        transcriptStatus,
         errorMessage.slice(0, 1000),
         now(),
         id,
       );
     } catch (error) {
       db.prepare(
-        "UPDATE crawler_runs SET status = ?, error_message = ?, completed_at = ? WHERE id = ?",
+        "UPDATE crawler_runs SET status = ?, transcript_status = ?, error_message = ?, completed_at = ? WHERE id = ?",
       ).run(
         "failed",
+        requestTranscript ? "failed" : "not_requested",
         error instanceof Error
           ? error.message.slice(0, 1000)
           : "导入采集结果失败。",
@@ -1283,6 +2046,7 @@ async function startMediaCrawlerRun({
 
 async function bootstrap() {
   const mediaCrawler = await getMediaCrawlerStatus();
+  const transcriptCapabilities = await probeCapabilities({ rootDir });
   const mapEvidence = (items) =>
     items.map((item) => ({
       ...item,
@@ -1318,8 +2082,10 @@ async function bootstrap() {
     topics: listTopics(),
     projects: db.prepare(`${projectSelect} ORDER BY p.updated_at DESC`).all(),
     connectors: { mediaCrawler },
+    transcriptCapabilities,
     crawlRuns: listCrawlerRuns(),
     inboxNotes: listInboxNotes(),
+    creatorAccounts: listCreatorAccounts(),
     libraryDocuments: listKnowledgeDocuments(),
     comments: db
       .prepare(
@@ -1349,6 +2115,15 @@ function sendJson(response, statusCode, payload, headers = {}) {
     ...headers,
   });
   response.end(JSON.stringify(payload));
+}
+
+function sendText(response, statusCode, contentType, body, headers = {}) {
+  response.writeHead(statusCode, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+    ...headers,
+  });
+  response.end(body);
 }
 
 async function handleApi(request, response, path) {
@@ -1458,6 +2233,76 @@ async function handleApi(request, response, path) {
       );
     return sendJson(response, 204, {}, { "Set-Cookie": clearSessionCookie() });
   }
+  if (request.method === "GET" && path === "/api/account") {
+    const user = getSession(request);
+    if (!user) return sendJson(response, 401, { error: "请先登录工作区。" });
+    return sendJson(response, 200, { user });
+  }
+  if (request.method === "PATCH" && path === "/api/account") {
+    const user = getSession(request);
+    if (!user) return sendJson(response, 401, { error: "请先登录工作区。" });
+    const body = await readJson(request);
+    const displayName = firstValue(body.displayName);
+    const email = firstValue(body.email).toLowerCase();
+    const currentPassword =
+      typeof body.currentPassword === "string" ? body.currentPassword : "";
+    const nextPassword =
+      typeof body.newPassword === "string" ? body.newPassword : "";
+    if (!displayName || displayName.length > 80)
+      return sendJson(response, 400, { error: "请输入 1 至 80 个字符的姓名。" });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(email) || email.length > 254)
+      return sendJson(response, 400, { error: "请输入有效的邮箱地址。" });
+    if (nextPassword && nextPassword.length > 256)
+      return sendJson(response, 400, {
+        error: "新密码不能超过 256 个字符。",
+      });
+    const record = db
+      .prepare(
+        "SELECT id, email, display_name AS displayName, password_hash AS passwordHash FROM workspace_users WHERE id = ?",
+      )
+      .get(user.id);
+    if (!record)
+      return sendJson(response, 404, { error: "未找到这个本地工作区账号。" });
+    const isEmailChanged =
+      record.email.toLocaleLowerCase() !== email.toLocaleLowerCase();
+    if ((isEmailChanged || nextPassword) && !currentPassword)
+      return sendJson(response, 400, { error: "请输入当前密码。" });
+    if (
+      (isEmailChanged || nextPassword) &&
+      !(await verifyPassword(currentPassword, record.passwordHash))
+    )
+      return sendJson(response, 401, { error: "当前密码不正确。" });
+    const nextUser = { id: user.id, email, displayName };
+    const currentTokenHash = getSessionTokenHash(request);
+    db.exec("BEGIN");
+    try {
+      db.prepare(
+        "UPDATE workspace_users SET email = ?, display_name = ?, password_hash = ? WHERE id = ?",
+      ).run(
+        nextUser.email,
+        nextUser.displayName,
+        nextPassword ? await hashPassword(nextPassword) : record.passwordHash,
+        user.id,
+      );
+      if (nextPassword && currentTokenHash) {
+        db.prepare(
+          "DELETE FROM workspace_sessions WHERE user_id = ? AND token_hash <> ?",
+        ).run(user.id, currentTokenHash);
+      }
+      db.exec("COMMIT");
+      return sendJson(response, 200, { user: nextUser });
+    } catch (error) {
+      db.exec("ROLLBACK");
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "SQLITE_CONSTRAINT_UNIQUE"
+      )
+        return sendJson(response, 409, { error: "这个邮箱已经被使用。" });
+      throw error;
+    }
+  }
   if (request.method === "GET" && path === "/api/workbuddy/status") {
     const user = getSession(request);
     if (!user) return sendJson(response, 401, { error: "请先登录工作区。" });
@@ -1473,8 +2318,49 @@ async function handleApi(request, response, path) {
       apiUrl: `http://127.0.0.1:${port}`,
     });
   }
+  if (request.method === "GET" && path === "/api/workbuddy/discovery") {
+    // This endpoint is intentionally callable WITHOUT a Cato session cookie:
+    // a WorkBuddy agent on the user's machine has no way to obtain one. It just
+    // returns metadata so the agent can construct the right JSON to write into
+    // ~/.workbuddy/mcp.json. The raw token must still come from POST /api/workbuddy/token
+    // (which itself requires the user to be logged into Cato). The agent is expected
+    // to prompt the user to copy the token after generation.
+    const user = getSession(request);
+    if (!user) {
+      // Fall back to returning metadata with hasActiveToken: false. The agent
+      // is told to ask the user to generate a fresh token in the Cato UI.
+      return sendJson(response, 200, {
+        mcpServerName: "cato-ai-content-workbench",
+        apiUrl: `http://127.0.0.1:${port}`,
+        mcpEndpoint: `http://127.0.0.1:${port}/mcp`,
+        configPath: join(homedir(), ".workbuddy", "mcp.json"),
+        hasActiveToken: false,
+        reissueInstructions: [
+          "请用户在 Cato 端（http://127.0.0.1:5173）点击左下角「连接 WorkBuddy」，",
+          "按「生成新的令牌」按钮拿到原始 token，再粘到对话里让 agent 写入 ~/.workbuddy/mcp.json。",
+        ],
+        configTemplate: {
+          mcpServers: {
+            "cato-ai-content-workbench": {
+              url: `http://127.0.0.1:${port}/mcp`,
+              type: "streamable-http",
+              headers: { Authorization: "Bearer <paste Cato token here>" },
+              timeout: 30000,
+            },
+          },
+        },
+      });
+    }
+    return sendJson(response, 200, getWorkBuddyDiscovery(user.id));
+  }
   if (path.startsWith("/api/workbuddy/")) {
     if (!requireWorkBuddyToken(request, response)) return;
+    if (request.method === "GET" && path === "/api/workbuddy/ping")
+      return sendJson(response, 200, {
+        ok: true,
+        service: "cato-ai-content-workbench",
+        pingedAt: now(),
+      });
     const url = new URL(request.url, "http://localhost");
     const query = (url.searchParams.get("q") || "").trim().slice(0, 120);
     const includesQuery = (value) =>
@@ -1619,6 +2505,77 @@ async function handleApi(request, response, path) {
     return sendJson(response, 401, { error: "请先登录工作区。" });
   if (request.method === "GET" && path === "/api/bootstrap")
     return sendJson(response, 200, await bootstrap());
+  if (request.method === "POST" && path === "/api/creator-accounts") {
+    const body = await readJson(request);
+    const draft = normalizeCreatorAccountDraft(body);
+    if (draft.error) return sendJson(response, 400, { error: draft.error });
+    const createdAt = now();
+    const account = {
+      id: crypto.randomUUID(),
+      ...draft.account,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    db.prepare(
+      "INSERT INTO creator_accounts (id, platform, display_name, handle, content_focus, audience, tone, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      account.id,
+      account.platform,
+      account.displayName,
+      account.handle,
+      account.contentFocus,
+      account.audience,
+      account.tone,
+      account.status,
+      account.notes,
+      account.createdAt,
+      account.updatedAt,
+    );
+    return sendJson(response, 201, { account });
+  }
+  const creatorAccountMatch = path.match(/^\/api\/creator-accounts\/([^/]+)$/);
+  const creatorAccountStatusMatch = path.match(
+    /^\/api\/creator-accounts\/([^/]+)\/status$/,
+  );
+  if (request.method === "PUT" && creatorAccountMatch) {
+    const accountId = decodeURIComponent(creatorAccountMatch[1]);
+    const body = await readJson(request);
+    const draft = normalizeCreatorAccountDraft(body);
+    if (draft.error) return sendJson(response, 400, { error: draft.error });
+    const updatedAt = now();
+    const result = db
+      .prepare(
+        "UPDATE creator_accounts SET platform = ?, display_name = ?, handle = ?, content_focus = ?, audience = ?, tone = ?, status = ?, notes = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(
+        draft.account.platform,
+        draft.account.displayName,
+        draft.account.handle,
+        draft.account.contentFocus,
+        draft.account.audience,
+        draft.account.tone,
+        draft.account.status,
+        draft.account.notes,
+        updatedAt,
+        accountId,
+      );
+    if (!result.changes)
+      return sendJson(response, 404, { error: "自媒体账号不存在。" });
+    return sendJson(response, 200, { account: getCreatorAccount(accountId) });
+  }
+  if (request.method === "PUT" && creatorAccountStatusMatch) {
+    const accountId = decodeURIComponent(creatorAccountStatusMatch[1]);
+    const body = await readJson(request);
+    const status = firstValue(body.status);
+    if (!["active", "paused"].includes(status))
+      return sendJson(response, 400, { error: "账号状态无效。" });
+    const result = db
+      .prepare("UPDATE creator_accounts SET status = ?, updated_at = ? WHERE id = ?")
+      .run(status, now(), accountId);
+    if (!result.changes)
+      return sendJson(response, 404, { error: "自媒体账号不存在。" });
+    return sendJson(response, 200, { account: getCreatorAccount(accountId) });
+  }
   if (request.method === "POST" && path === "/api/inbox") {
     const body = await readJson(request);
     const noteBody = firstValue(body.body);
@@ -1931,12 +2888,22 @@ async function handleApi(request, response, path) {
         sourceUrl,
         requestTranscript,
       });
+      const capabilities = requestTranscript
+        ? await probeCapabilities({ rootDir })
+        : null;
+      const transcriptReady = Boolean(
+        capabilities && (capabilities.subtitlePath || capabilities.asrPath),
+      );
       return sendJson(response, 202, {
         run,
-        transcript:
-          requestTranscript
-            ? { status: "not_configured", message: "本机尚未配置口播转写引擎。" }
-            : { status: "not_requested" },
+        transcript: requestTranscript
+          ? {
+              status: transcriptReady ? "queued" : "not_configured",
+              message: transcriptReady
+                ? "转写将在采集导入完成后执行。"
+                : capabilities.hint,
+            }
+          : { status: "not_requested" },
       });
     } catch (error) {
       return sendJson(response, 409, {
@@ -2012,8 +2979,82 @@ async function handleApi(request, response, path) {
     );
     return sendJson(response, 201, { item });
   }
+  if (request.method === "GET" && path === "/api/transcript/capabilities")
+    return sendJson(response, 200, {
+      // 显式查询状态时不用缓存：用户点「检测」就是想看当前真实情况。
+      capabilities: await probeCapabilities({ rootDir, refresh: true }),
+      setup: getSetupState(),
+    });
+  if (request.method === "POST" && path === "/api/transcript/setup") {
+    // target 允许前端触发「装解析器」与「下语音模型」两个独立动作：
+    // 模型体积大（150 MB 起），不该在用户只想装解析器时顺手拉下来。
+    const body = await readJson(request).catch(() => ({}));
+    if (body?.target === "model") {
+      const result = await downloadWhisperModel({
+        rootDir,
+        size: body.size || "small",
+      });
+      return sendJson(response, result.ok ? 200 : 409, result);
+    }
+    const result = await setupTranscriptEngine({ rootDir });
+    return sendJson(response, result.ok ? 200 : 409, result);
+  }
+  if (request.method === "POST" && path === "/api/evidence/from-url") {
+    const body = await readJson(request);
+    const sourceUrl = extractSharedUrl(body.sourceUrl);
+    if (!sourceUrl)
+      return sendJson(response, 400, {
+        error: "请输入以 http(s) 开头的视频链接。",
+      });
+    const capabilities = await probeCapabilities({ rootDir });
+    const outcome = await extractTranscriptFromUrl({
+      url: sourceUrl,
+      capabilities,
+    });
+    const saved = saveEvidenceFromUrlOutcome({ sourceUrl, outcome });
+    if (!saved)
+      return sendJson(response, 409, {
+        error: outcome.error || "未能解析该链接。",
+        transcript: summarizeTranscriptOutcome(outcome),
+        capabilities,
+      });
+    return sendJson(response, saved.created ? 201 : 200, {
+      item: saved.item,
+      created: saved.created,
+      transcript: summarizeTranscriptOutcome(outcome, saved.item.transcript),
+      capabilities,
+    });
+  }
+
   const evidenceMatch = path.match(/^\/api\/evidence\/([^/]+)$/);
   const archiveMatch = path.match(/^\/api\/evidence\/([^/]+)\/archive$/);
+  const evidenceTranscriptMatch = path.match(
+    /^\/api\/evidence\/([^/]+)\/transcript$/,
+  );
+  if (request.method === "POST" && evidenceTranscriptMatch) {
+    const evidenceId = decodeURIComponent(evidenceTranscriptMatch[1]);
+    const item = db
+      .prepare(
+        "SELECT id, title, source_url AS sourceUrl, video_url AS videoUrl FROM evidence_items WHERE id = ?",
+      )
+      .get(evidenceId);
+    if (!item) return sendJson(response, 404, { error: "内容情报不存在。" });
+    const capabilities = await probeCapabilities({ rootDir });
+    const outcome = await resolveTranscriptForEvidence(item, capabilities);
+    const text = applyTranscriptOutcome(evidenceId, outcome);
+    return sendJson(response, outcome.status === "succeeded" ? 200 : 409, {
+      transcript: {
+        status: outcome.status,
+        source: outcome.source || "",
+        text,
+        chars: Array.from(text).length,
+        stages: outcome.stages || [],
+        error: outcome.error || "",
+        hint: outcome.hint || "",
+      },
+      capabilities,
+    });
+  }
   if (request.method === "PUT" && archiveMatch) {
     const evidenceId = decodeURIComponent(archiveMatch[1]);
     const body = await readJson(request);
@@ -2440,6 +3481,26 @@ const server = createServer(async (request, response) => {
     `http://${request.headers.host || "localhost"}`,
   );
   try {
+    if (url.pathname === "/workbuddy" || url.pathname === "/workbuddy.md") {
+      if (request.method !== "GET") {
+        sendJson(response, 405, { error: "Method not allowed." });
+        return;
+      }
+      serveWorkBuddyInstallGuide(response);
+      return;
+    }
+    if (url.pathname === "/mcp" || url.pathname === "/mcp/") {
+      if (
+        request.method !== "POST" &&
+        request.method !== "GET" &&
+        request.method !== "DELETE"
+      ) {
+        sendJson(response, 405, { error: "Method not allowed." });
+        return;
+      }
+      await handleMcpRequest(request, response);
+      return;
+    }
     if (url.pathname.startsWith("/api/"))
       return await handleApi(request, response, url.pathname);
     if (vite)

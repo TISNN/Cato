@@ -9,18 +9,22 @@ import {
 } from "react";
 import {
   Archive,
+  AtSign,
   ArrowUpRight,
   BookOpen,
   CalendarDays,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleHelp,
   Command,
+  Copy,
   FilePenLine,
   FolderOpen,
   Image as ImageIcon,
   Inbox,
+  KeyRound,
   LayoutDashboard,
   Link2,
   Lightbulb,
@@ -28,9 +32,12 @@ import {
   MessageCircle,
   Plus,
   RotateCcw,
+  Save,
   Search,
+  Settings,
   Tag,
   Trash2,
+  UserRound,
   X,
 } from "lucide-react";
 
@@ -43,8 +50,36 @@ type Section =
   | "创作项目"
   | "发布日历"
   | "素材资产"
-  | "归档";
+  | "归档"
+  | "账号管理"
+  | "个人设置";
+type WorkspaceUser = { id: string; email: string; displayName: string };
 type Platform = "小红书" | "公众号" | "抖音";
+type CreatorAccountStatus = "active" | "paused";
+type CreatorAccount = {
+  id: string;
+  platform: Platform;
+  displayName: string;
+  handle: string;
+  contentFocus: string;
+  audience: string;
+  tone: string;
+  status: CreatorAccountStatus;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+};
+type CreatorAccountDraft = Pick<
+  CreatorAccount,
+  | "platform"
+  | "displayName"
+  | "handle"
+  | "contentFocus"
+  | "audience"
+  | "tone"
+  | "status"
+  | "notes"
+>;
 type ContentFormat = "图文笔记" | "长文文章" | "短视频脚本" | "口播稿";
 type ReviewStatus = "草稿" | "待审核" | "已批准";
 type IntelligenceItem = {
@@ -174,6 +209,45 @@ type CrawlRequest = Pick<CrawlRun, "platform" | "query" | "maxItems"> & {
   sourceUrl?: string;
   requestTranscript?: boolean;
 };
+type TranscriptEngine = {
+  id: "ytdlp" | "ffmpeg" | "asr";
+  label: string;
+  purpose: string;
+  available: boolean;
+  path: string;
+  version: string;
+  kind?: "mlx" | "openai" | "whisper_cpp" | "unknown" | "none";
+  model?: string;
+  missingModel?: boolean;
+};
+type TranscriptCapabilities = {
+  ytdlp: TranscriptEngine;
+  ffmpeg: TranscriptEngine;
+  asr: TranscriptEngine;
+  subtitlePath: boolean;
+  asrPath: boolean;
+  mode: "full" | "subtitle_only" | "unavailable";
+  hint: string;
+  checkedAt: string;
+};
+type TranscriptStage = { stage: string; status: string; detail: string };
+type TranscriptOutcome = {
+  status: "succeeded" | "not_configured" | "unsupported" | "failed";
+  source: string;
+  chars: number;
+  language: string;
+  stages: TranscriptStage[];
+  error: string;
+  hint: string;
+};
+type LinkExtractResult = {
+  item: IntelligenceItem;
+  created: boolean;
+  transcript: TranscriptOutcome;
+};
+type LinkExtractOutcome =
+  | LinkExtractResult & { ok: true }
+  | { ok: false; error: string; transcript: TranscriptOutcome | null };
 type IntelligenceComment = {
   id: string;
   evidenceId: string;
@@ -192,8 +266,10 @@ type BootstrapData = {
   topics: Topic[];
   projects: Project[];
   connectors: { mediaCrawler: MediaCrawlerConnector };
+  transcriptCapabilities: TranscriptCapabilities | null;
   crawlRuns: CrawlRun[];
   inboxNotes: InboxNote[];
+  creatorAccounts: CreatorAccount[];
   libraryDocuments: LibraryDocument[];
   comments: IntelligenceComment[];
 };
@@ -206,6 +282,7 @@ type WorkBuddyConnectionStatus = {
 
 const navItems: Array<{ label: Section; icon: typeof LayoutDashboard }> = [
   { label: "概览", icon: LayoutDashboard },
+  { label: "账号管理", icon: AtSign },
   { label: "内容情报", icon: Inbox },
   { label: "灵感收件箱", icon: Lightbulb },
   { label: "资料库", icon: BookOpen },
@@ -215,22 +292,40 @@ const navItems: Array<{ label: Section; icon: typeof LayoutDashboard }> = [
 ];
 const reviewTone = (status: ReviewStatus) =>
   status === "待审核" ? "review" : status === "已批准" ? "success" : "schedule";
+const platforms: Platform[] = ["小红书", "公众号", "抖音"];
 const platformLogoSrc: Record<Platform, string> = {
   小红书: "https://cdn.simpleicons.org/xiaohongshu/FF2442",
   公众号: "https://cdn.simpleicons.org/wechat/07C160",
   抖音: "https://cdn.simpleicons.org/tiktok/000000",
 };
+const platformInitial: Record<Platform, string> = {
+  小红书: "小",
+  公众号: "微",
+  抖音: "抖",
+};
 const crawlerPlatformLogoSrc = {
   xhs: platformLogoSrc.小红书,
   dy: platformLogoSrc.抖音,
 } as const;
+const transcriptStatusLabel: Record<
+  IntelligenceItem["transcriptStatus"],
+  string
+> = {
+  not_requested: "未提取",
+  not_configured: "引擎未就绪",
+  queued: "排队中",
+  running: "提取中",
+  succeeded: "已提取",
+  failed: "提取失败",
+};
 
 type CatoWorkbenchProps = {
-  user: { id: string; email: string; displayName: string };
+  user: WorkspaceUser;
+  onUserChange: (user: WorkspaceUser) => void;
   onLogout: () => void;
 };
 
-function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
+function CatoWorkbench({ user, onUserChange, onLogout }: CatoWorkbenchProps) {
   const workspaceName = user.displayName || user.email.split("@")[0] || "工作区";
   const [section, setSection] = useState<Section>("概览");
   const [intelligenceSeedId, setIntelligenceSeedId] = useState<string | null>(
@@ -252,7 +347,10 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
   const [mediaCrawler, setMediaCrawler] =
     useState<MediaCrawlerConnector | null>(null);
   const [crawlRuns, setCrawlRuns] = useState<CrawlRun[]>([]);
+  const [transcriptCapabilities, setTranscriptCapabilities] =
+    useState<TranscriptCapabilities | null>(null);
   const [inboxNotes, setInboxNotes] = useState<InboxNote[]>([]);
+  const [creatorAccounts, setCreatorAccounts] = useState<CreatorAccount[]>([]);
   const [libraryDocuments, setLibraryDocuments] = useState<LibraryDocument[]>(
     [],
   );
@@ -267,6 +365,12 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
     useState<WorkBuddyConnectionStatus | null>(null);
   const [workBuddyToken, setWorkBuddyToken] = useState("");
   const [isWorkBuddyLoading, setIsWorkBuddyLoading] = useState(false);
+  const [isWorkBuddyTesting, setIsWorkBuddyTesting] = useState(false);
+  const [workBuddyPing, setWorkBuddyPing] = useState<{
+    ok: boolean;
+    at: string;
+    message: string;
+  } | null>(null);
   const [intelligenceSearchRequest, setIntelligenceSearchRequest] = useState<{
     query: string;
     id: number;
@@ -289,7 +393,9 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
       setProjects(data.projects);
       setMediaCrawler(data.connectors?.mediaCrawler ?? null);
       setCrawlRuns(data.crawlRuns ?? []);
+      setTranscriptCapabilities(data.transcriptCapabilities ?? null);
       setInboxNotes(data.inboxNotes ?? []);
+      setCreatorAccounts(data.creatorAccounts ?? []);
       setLibraryDocuments(data.libraryDocuments ?? []);
       setComments(data.comments ?? []);
       setDataState("ready");
@@ -486,6 +592,151 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
       return false;
     }
   };
+  const extractFromUrl = async (sourceUrl: string) => {
+    try {
+      const response = await fetch("/api/evidence/from-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceUrl }),
+      });
+      const data = (await response.json()) as {
+        item?: IntelligenceItem;
+        created?: boolean;
+        transcript?: TranscriptOutcome;
+        capabilities?: TranscriptCapabilities;
+        error?: string;
+      };
+      if (data.capabilities) setTranscriptCapabilities(data.capabilities);
+      if (!response.ok || !data.item || !data.transcript)
+        return {
+          ok: false as const,
+          error: data.error || "无法从该链接提取文案。",
+          transcript: data.transcript ?? null,
+        };
+      setSources((current) => [
+        data.item!,
+        ...current.filter((item) => item.id !== data.item!.id),
+      ]);
+      setNotice(
+        data.transcript.status === "succeeded"
+          ? `${data.created ? "已导入" : "已更新"}「${data.item.title}」，逐字稿 ${data.transcript.chars} 字。`
+          : `已导入「${data.item.title}」，但未提取到逐字稿。`,
+      );
+      return {
+        ok: true as const,
+        item: data.item,
+        created: Boolean(data.created),
+        transcript: data.transcript,
+      };
+    } catch (error) {
+      return {
+        ok: false as const,
+        error: error instanceof Error ? error.message : "无法从该链接提取文案。",
+        transcript: null,
+      };
+    }
+  };
+  const refreshTranscript = async (evidenceId: string) => {
+    try {
+      const response = await fetch(
+        `/api/evidence/${encodeURIComponent(evidenceId)}/transcript`,
+        { method: "POST" },
+      );
+      const data = (await response.json()) as {
+        transcript?: TranscriptOutcome & { text: string };
+        capabilities?: TranscriptCapabilities;
+        error?: string;
+      };
+      if (data.capabilities) setTranscriptCapabilities(data.capabilities);
+      const outcome = data.transcript;
+      if (!outcome) throw new Error(data.error || "逐字稿提取失败。");
+      const status: IntelligenceItem["transcriptStatus"] =
+        outcome.status === "succeeded"
+          ? "succeeded"
+          : outcome.status === "not_configured"
+            ? "not_configured"
+            : "failed";
+      const text = outcome.status === "succeeded" ? outcome.text || "" : "";
+      setSources((current) =>
+        current.map((item) =>
+          item.id === evidenceId
+            ? { ...item, transcript: text, transcriptStatus: status }
+            : item,
+        ),
+      );
+      setNotice(
+        outcome.status === "succeeded"
+          ? `逐字稿已更新，共 ${outcome.chars} 字。`
+          : outcome.error || outcome.hint || "未能提取逐字稿。",
+      );
+      return outcome;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "逐字稿提取失败。");
+      return null;
+    }
+  };
+  const installTranscriptEngine = async () => {
+    try {
+      const response = await fetch("/api/transcript/setup", { method: "POST" });
+      const data = (await response.json()) as {
+        ok?: boolean;
+        error?: string;
+        skipped?: boolean;
+        capabilities?: TranscriptCapabilities;
+      };
+      if (data.capabilities) setTranscriptCapabilities(data.capabilities);
+      if (!response.ok || !data.ok)
+        throw new Error(data.error || "安装 yt-dlp 失败。");
+      setNotice(
+        data.skipped
+          ? "yt-dlp 已是最新版本。"
+          : "yt-dlp 已安装，现在可以解析链接并抓取原生字幕。",
+      );
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "安装 yt-dlp 失败。");
+      return false;
+    }
+  };
+  const installWhisperModel = async (size = "small") => {
+    try {
+      const response = await fetch("/api/transcript/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: "model", size }),
+      });
+      const data = (await response.json()) as {
+        ok?: boolean;
+        error?: string;
+        skipped?: boolean;
+        capabilities?: TranscriptCapabilities;
+      };
+      if (data.capabilities) setTranscriptCapabilities(data.capabilities);
+      if (!response.ok || !data.ok)
+        throw new Error(data.error || "下载语音模型失败。");
+      setNotice(
+        data.skipped
+          ? "语音模型已存在，跳过下载。"
+          : "语音模型下载完成，现在可以对没有字幕的视频做语音转写。",
+      );
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "下载语音模型失败。");
+      return false;
+    }
+  };
+  const recheckTranscriptCapabilities = async () => {
+    try {
+      const response = await fetch("/api/transcript/capabilities");
+      const data = (await response.json()) as {
+        capabilities?: TranscriptCapabilities;
+      };
+      if (data.capabilities) setTranscriptCapabilities(data.capabilities);
+      return Boolean(data.capabilities);
+    } catch {
+      return false;
+    }
+  };
   const saveInboxNote = async (body: string, tags: string[]) => {
     try {
       const response = await fetch("/api/inbox", {
@@ -545,6 +796,73 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
       return true;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "创建选题失败。");
+      return false;
+    }
+  };
+  const saveCreatorAccount = async (
+    draft: CreatorAccountDraft & { id?: string },
+  ) => {
+    try {
+      const endpoint = draft.id
+        ? `/api/creator-accounts/${encodeURIComponent(draft.id)}`
+        : "/api/creator-accounts";
+      const response = await fetch(endpoint, {
+        method: draft.id ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(draft),
+      });
+      const data = (await response.json()) as {
+        account?: CreatorAccount;
+        error?: string;
+      };
+      if (!response.ok || !data.account)
+        throw new Error(data.error || "自媒体账号保存失败。");
+      setCreatorAccounts((current) =>
+        draft.id
+          ? current.map((item) =>
+              item.id === data.account!.id ? data.account! : item,
+            )
+          : [data.account!, ...current],
+      );
+      setNotice(`已保存「${data.account.displayName}」。`);
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "自媒体账号保存失败。");
+      return false;
+    }
+  };
+  const updateCreatorAccountStatus = async (
+    accountId: string,
+    status: CreatorAccountStatus,
+  ) => {
+    try {
+      const response = await fetch(
+        `/api/creator-accounts/${encodeURIComponent(accountId)}/status`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status }),
+        },
+      );
+      const data = (await response.json()) as {
+        account?: CreatorAccount;
+        error?: string;
+      };
+      if (!response.ok || !data.account)
+        throw new Error(data.error || "账号状态更新失败。");
+      setCreatorAccounts((current) =>
+        current.map((item) =>
+          item.id === data.account!.id ? data.account! : item,
+        ),
+      );
+      setNotice(
+        status === "active"
+          ? `已启用「${data.account.displayName}」。`
+          : `已停用「${data.account.displayName}」。`,
+      );
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "账号状态更新失败。");
       return false;
     }
   };
@@ -961,6 +1279,83 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
       setIsWorkBuddyLoading(false);
     }
   };
+  const testWorkBuddyConnection = async () => {
+    const token = workBuddyToken;
+    if (!token) {
+      setNotice("请先生成连接令牌。");
+      return;
+    }
+    setIsWorkBuddyTesting(true);
+    try {
+      const endpoint = `${workBuddyStatus?.apiUrl || "http://127.0.0.1:5173"}/api/workbuddy/ping`;
+      const isLocal = endpoint.startsWith("http://127.0.0.1");
+      const response = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        pingedAt?: string;
+        service?: string;
+        error?: string;
+      };
+      if (response.ok && data.ok) {
+        setWorkBuddyPing({
+          ok: true,
+          at: data.pingedAt || new Date().toISOString(),
+          message: `连通 · ${data.service || "cato"}`,
+        });
+      } else {
+        setWorkBuddyPing({
+          ok: false,
+          at: new Date().toISOString(),
+          message:
+            data.error ||
+            (response.ok ? "Cato 返回了非 ok 的响应。" : `HTTP ${response.status}`),
+        });
+        if (!isLocal && response.status === 0) {
+          // surface a clearer notice for cross-origin failures
+          setNotice(
+            "测试请求失败，可能是浏览器不允许跨域访问本地服务，请保持 Cato 与 WorkBuddy 在同一台机器。",
+          );
+        }
+      }
+    } catch (error) {
+      setWorkBuddyPing({
+        ok: false,
+        at: new Date().toISOString(),
+        message:
+          error instanceof Error ? error.message : "无法连接到 Cato MCP 端点。",
+      });
+    } finally {
+      setIsWorkBuddyTesting(false);
+    }
+  };
+  const copyWorkBuddyMcpConfig = async () => {
+    if (!workBuddyToken) {
+      setNotice("请先生成连接令牌。");
+      return;
+    }
+    const apiUrl = workBuddyStatus?.apiUrl || "http://127.0.0.1:5173";
+    const config = {
+      mcpServers: {
+        "cato-ai-content-workbench": {
+          url: `${apiUrl}/mcp`,
+          type: "streamable-http",
+          headers: {
+            Authorization: `Bearer ${workBuddyToken}`,
+          },
+          timeout: 30000,
+        },
+      },
+    };
+    const payload = JSON.stringify(config, null, 2);
+    try {
+      await navigator.clipboard.writeText(payload);
+      setNotice("MCP 配置已复制。粘到 WorkBuddy「自定义连接器 → 配置 MCP」并 Trust。");
+    } catch {
+      setNotice("无法访问剪贴板，请手动选择下方整段 JSON。");
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -1038,6 +1433,16 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
             <Link2 size={16} />
             连接 WorkBuddy
           </button>
+          <button
+            className={`help-link ${section === "个人设置" ? "is-active" : ""}`}
+            onClick={() => {
+              setSection("个人设置");
+              setNotice("已打开个人设置。");
+            }}
+          >
+            <Settings size={16} />
+            个人设置
+          </button>
           <div className="person-row">
             <div className="avatar">{workspaceName.slice(0, 1).toUpperCase()}</div>
             <div>
@@ -1088,6 +1493,17 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
               <span className="notification-dot" />
               <Inbox size={18} strokeWidth={1.8} />
             </button>
+            <button
+              className="icon-button mobile-account-button"
+              aria-label="自媒体账号管理"
+              title="自媒体账号管理"
+              onClick={() => {
+                setSection("账号管理");
+                setNotice("已打开账号管理。");
+              }}
+            >
+              <AtSign size={18} strokeWidth={1.8} />
+            </button>
           </div>
         </header>
         <main id="main-content" className="main-content">
@@ -1129,6 +1545,12 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
                   onSaveEvidence={saveEvidence}
                   onDeleteEvidence={deleteEvidence}
                   onArchiveEvidence={(id) => archiveEvidence(id, true)}
+                  transcriptCapabilities={transcriptCapabilities}
+                  onExtractFromUrl={extractFromUrl}
+                  onRefreshTranscript={refreshTranscript}
+                  onInstallTranscriptEngine={installTranscriptEngine}
+                  onInstallWhisperModel={installWhisperModel}
+                  onRecheckTranscriptCapabilities={recheckTranscriptCapabilities}
                   seedItemId={intelligenceSeedId}
                   onSeedHandled={() => setIntelligenceSeedId(null)}
                   searchRequest={intelligenceSearchRequest}
@@ -1188,6 +1610,7 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
                   isLoading={dataState === "loading"}
                   onArchiveEvidence={(id) => archiveEvidence(id, true)}
                   onOpenIntelligence={() => setSection("内容情报")}
+                  onRefreshTranscript={refreshTranscript}
                   onCreateTopicFromAsset={(itemId) => {
                     setIntelligenceSeedId(itemId);
                     setSection("内容情报");
@@ -1200,6 +1623,21 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
                   items={archivedSources}
                   isLoading={dataState === "loading"}
                   onRestore={(id) => archiveEvidence(id, false)}
+                />
+              )}
+              {section === "账号管理" && (
+                <CreatorAccountsView
+                  accounts={creatorAccounts}
+                  onSave={saveCreatorAccount}
+                  onStatusChange={updateCreatorAccountStatus}
+                />
+              )}
+              {section === "个人设置" && (
+                <PersonalSettingsView
+                  user={user}
+                  onUserChange={onUserChange}
+                  onLogout={logout}
+                  onNotice={setNotice}
                 />
               )}
             </>
@@ -1230,20 +1668,18 @@ function CatoWorkbench({ user, onLogout }: CatoWorkbenchProps) {
           status={workBuddyStatus}
           token={workBuddyToken}
           isLoading={isWorkBuddyLoading}
+          isTesting={isWorkBuddyTesting}
+          workBuddyPing={workBuddyPing}
           onClose={() => {
             setWorkBuddyOpen(false);
             setWorkBuddyToken("");
+            setWorkBuddyPing(null);
           }}
-          onGenerate={() => void createWorkBuddyToken()}
-          onCopy={async () => {
-            if (!workBuddyToken) return;
-            try {
-              await navigator.clipboard.writeText(workBuddyToken);
-              setNotice("令牌已复制。请粘贴到 WorkBuddy，不要发送到聊天中。");
-            } catch {
-              setNotice("无法访问剪贴板，请手动复制令牌。");
-            }
+          onGenerate={() => {
+            void createWorkBuddyToken();
           }}
+          onCopyMcpConfig={copyWorkBuddyMcpConfig}
+          onTestConnection={testWorkBuddyConnection}
         />
       )}
       <p className="sr-only" aria-live="polite">
@@ -1259,15 +1695,22 @@ function WorkBuddyConnectionPanel({
   isLoading,
   onClose,
   onGenerate,
-  onCopy,
+  onCopyMcpConfig,
+  onTestConnection,
+  isTesting,
+  workBuddyPing,
 }: {
   status: WorkBuddyConnectionStatus | null;
   token: string;
   isLoading: boolean;
   onClose: () => void;
   onGenerate: () => void;
-  onCopy: () => Promise<void>;
+  onCopyMcpConfig: () => Promise<void>;
+  onTestConnection: () => Promise<void>;
+  isTesting: boolean;
+  workBuddyPing: { ok: boolean; at: string; message: string } | null;
 }) {
+  const mcpEndpoint = `${status?.apiUrl || "http://127.0.0.1:5173"}/mcp`;
   return (
     <aside className="workbuddy-panel" aria-label="连接 WorkBuddy">
       <header className="panel-header">
@@ -1281,59 +1724,758 @@ function WorkBuddyConnectionPanel({
       </header>
       <div className="workbuddy-body">
         <div className="workbuddy-status">
-          <span className={status?.connected ? "status-dot is-ready" : "status-dot"} />
-          <span>{status?.connected ? "已生成连接令牌" : "尚未生成连接令牌"}</span>
+          <span className={workBuddyPing?.ok ? "status-dot success" : "status-dot"} />
+          <span>
+            {workBuddyPing?.ok
+              ? `已连通（最近一次 ${formatClock(workBuddyPing.at)}）`
+              : status?.connected
+                ? "已生成连接令牌"
+                : "尚未生成连接令牌"}
+          </span>
         </div>
         <ol className="workbuddy-steps">
           <li>
             <span>1</span>
             <div>
-              <strong>导入连接器</strong>
-              <p>在 WorkBuddy 的连接器页导入 Cato Connector 包。</p>
-              <a href="/cato-workbuddy-connector.zip" download>
-                下载 Connector 包 <ArrowUpRight size={14} />
-              </a>
-            </div>
-          </li>
-          <li>
-            <span>2</span>
-            <div>
               <strong>生成令牌</strong>
-              <p>重新生成会立即断开旧的 WorkBuddy 连接。</p>
+              <p>
+                Cato 端每次只保留一个有效令牌；重新生成会立刻让旧的 WorkBuddy 调用失效。
+              </p>
               <button
                 className={token ? "text-button" : "primary-button"}
                 type="button"
                 disabled={isLoading}
                 onClick={onGenerate}
               >
-                {isLoading ? "生成中" : token ? "生成新的令牌" : "生成连接令牌"}
+                {isLoading
+                  ? "生成中"
+                  : token
+                    ? "生成新的令牌"
+                    : "生成连接令牌"}
               </button>
+            </div>
+          </li>
+          <li>
+            <span>2</span>
+            <div>
+              <strong>复制 MCP 配置</strong>
+              <p>
+                在 WorkBuddy 客户端按 <kbd>⌘K</kbd> 打开"连接器 → 自定义连接器 →
+                配置 MCP"，把下面的整段 JSON 粘进去，保存后点击 <strong>Trust</strong>{" "}
+                启用。
+              </p>
+              <div className="workbuddy-token">
+                <input
+                  value={`${mcpEndpoint}   ←   在 WorkBuddy 粘贴时使用此地址`}
+                  readOnly
+                  aria-label="Cato MCP 端点"
+                  onFocus={(event) => event.target.select()}
+                />
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={!token}
+                  onClick={() => void onCopyMcpConfig()}
+                >
+                  复制配置
+                </button>
+              </div>
+              <details className="workbuddy-snippet">
+                <summary>查看完整配置</summary>
+                <pre aria-label="WorkBuddy MCP 配置 JSON">
+{`{
+  "mcpServers": {
+    "cato-ai-content-workbench": {
+      "url": "${mcpEndpoint}",
+      "type": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer ${token || "请先生成令牌"}"
+      },
+      "timeout": 30000
+    }
+  }
+}`}
+                </pre>
+              </details>
             </div>
           </li>
           <li>
             <span>3</span>
             <div>
-              <strong>粘贴到 WorkBuddy</strong>
-              <p>连接器表单中的本地地址保持默认即可。</p>
-              {token ? (
-                <div className="workbuddy-token">
-                  <input value={token} readOnly aria-label="Cato WorkBuddy 连接令牌" />
-                  <button className="text-button" type="button" onClick={() => void onCopy()}>
-                    复制
-                  </button>
-                </div>
-              ) : (
-                <span className="workbuddy-url">{status?.apiUrl || "http://127.0.0.1:5173"}</span>
+              <strong>测试连接</strong>
+              <p>回到 Cato 后点一次，确认 WorkBuddy 能否调到本机 MCP 端点。</p>
+              <div className="workbuddy-token">
+                <button
+                  className={workBuddyPing?.ok ? "text-button" : "primary-button"}
+                  type="button"
+                  disabled={isTesting || !token}
+                  onClick={() => void onTestConnection()}
+                >
+                  {isTesting ? "测试中" : "测试连接"}
+                </button>
+                {workBuddyPing && (
+                  <span
+                    className={
+                      workBuddyPing.ok
+                        ? "workbuddy-pill workbuddy-pill-ok"
+                        : "workbuddy-pill workbuddy-pill-fail"
+                    }
+                  >
+                    {workBuddyPing.message}
+                  </span>
+                )}
+              </div>
+              {workBuddyPing && !workBuddyPing.ok && (
+                <p className="workbuddy-hint">
+                  失败常见原因：WorkBuddy 没有点 Trust、令牌被重新生成过、或
+                  <code> CATO_API_URL </code>
+                  与 Cato 实际监听端口不一致。
+                </p>
               )}
             </div>
           </li>
         </ol>
         <p className="workbuddy-note">
-          WorkBuddy 通过受限 API 访问 Cato；它不会直接读取 SQLite。写入灵感和创建项目都要求在对话中再次确认。
+          WorkBuddy 通过 Bearer Token 访问本机 Cato 的 MCP
+          端点；它不会直接读取 SQLite。写入灵感、创建项目都要求在对话中再次确认。
+          若令牌失效，重新生成后请到连接器页面更新 Bearer，再回到这里测试。
         </p>
       </div>
     </aside>
   );
+}
+
+function CreatorAccountsView({
+  accounts,
+  onSave,
+  onStatusChange,
+}: {
+  accounts: CreatorAccount[];
+  onSave: (draft: CreatorAccountDraft & { id?: string }) => Promise<boolean>;
+  onStatusChange: (
+    accountId: string,
+    status: CreatorAccountStatus,
+  ) => Promise<boolean>;
+}) {
+  const blankDraft: CreatorAccountDraft = {
+    platform: "小红书",
+    displayName: "",
+    handle: "",
+    contentFocus: "",
+    audience: "",
+    tone: "",
+    status: "active",
+    notes: "",
+  };
+  const [platform, setPlatform] = useState<"全部" | Platform>("全部");
+  const [status, setStatus] = useState<"全部" | CreatorAccountStatus>("全部");
+  const [editing, setEditing] = useState<CreatorAccount | null>(null);
+  const [draft, setDraft] = useState<CreatorAccountDraft>(blankDraft);
+  const [isSaving, setIsSaving] = useState(false);
+  const [formOpen, setFormOpen] = useState(accounts.length === 0);
+  const visibleAccounts = accounts.filter(
+    (account) =>
+      (platform === "全部" || account.platform === platform) &&
+      (status === "全部" || account.status === status),
+  );
+  const activeCount = accounts.filter((account) => account.status === "active").length;
+  const platformCounts = platforms.map((item) => ({
+    platform: item,
+    count: accounts.filter((account) => account.platform === item).length,
+  }));
+
+  useEffect(() => {
+    if (accounts.length === 0) setFormOpen(true);
+  }, [accounts.length]);
+
+  const openNew = () => {
+    setEditing(null);
+    setDraft(blankDraft);
+    setFormOpen(true);
+  };
+  const openEdit = (account: CreatorAccount) => {
+    setEditing(account);
+    setDraft({
+      platform: account.platform,
+      displayName: account.displayName,
+      handle: account.handle,
+      contentFocus: account.contentFocus,
+      audience: account.audience,
+      tone: account.tone,
+      status: account.status,
+      notes: account.notes,
+    });
+    setFormOpen(true);
+  };
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!draft.displayName.trim()) return;
+    setIsSaving(true);
+    const saved = await onSave({
+      ...draft,
+      displayName: draft.displayName.trim(),
+      handle: draft.handle.trim(),
+      contentFocus: draft.contentFocus.trim(),
+      audience: draft.audience.trim(),
+      tone: draft.tone.trim(),
+      notes: draft.notes.trim(),
+      id: editing?.id,
+    });
+    setIsSaving(false);
+    if (saved) {
+      setEditing(null);
+      setDraft(blankDraft);
+      setFormOpen(false);
+    }
+  };
+
+  return (
+    <section className="creator-accounts-view">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">账号管理</p>
+          <h1>自媒体账号</h1>
+          <p className="page-summary">
+            维护平台账号、定位、受众和内容方向。
+          </p>
+        </div>
+        <button className="primary-button" onClick={openNew}>
+          <Plus size={16} />
+          新建账号
+        </button>
+      </div>
+
+      <div className="account-summary-strip" aria-label="账号概览">
+        <div>
+          <span>全部账号</span>
+          <strong>{accounts.length}</strong>
+        </div>
+        <div>
+          <span>启用中</span>
+          <strong>{activeCount}</strong>
+        </div>
+        {platformCounts.map(({ platform: item, count }) => (
+          <div key={item}>
+            <span>{item}</span>
+            <strong>{count}</strong>
+          </div>
+        ))}
+      </div>
+
+      <div className={`creator-account-layout ${formOpen ? "has-form" : ""}`}>
+        <div>
+          <div className="account-toolbar">
+            <div className="filter-tabs" role="tablist" aria-label="平台筛选">
+              {(["全部", ...platforms] as Array<"全部" | Platform>).map((item) => (
+                <button
+                  key={item}
+                  role="tab"
+                  aria-selected={platform === item}
+                  className={platform === item ? "is-active" : ""}
+                  onClick={() => setPlatform(item)}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+            <div className="filter-tabs" role="tablist" aria-label="状态筛选">
+              {(["全部", "active", "paused"] as Array<
+                "全部" | CreatorAccountStatus
+              >).map((item) => (
+                <button
+                  key={item}
+                  role="tab"
+                  aria-selected={status === item}
+                  className={status === item ? "is-active" : ""}
+                  onClick={() => setStatus(item)}
+                >
+                  {item === "active" ? "启用" : item === "paused" ? "停用" : "全部"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <section className="work-section account-list-section" aria-label="自媒体账号列表">
+            {visibleAccounts.length ? (
+              <div className="creator-account-list">
+                {visibleAccounts.map((account) => (
+                  <article className="creator-account-row" key={account.id}>
+                    <span
+                      className="creator-account-platform-mark"
+                      data-platform={account.platform}
+                      aria-hidden="true"
+                    >
+                      {platformInitial[account.platform]}
+                    </span>
+                    <div className="creator-account-main">
+                      <div className="creator-account-title">
+                        <h2>{account.displayName}</h2>
+                        <span className={`status-tag ${account.status === "active" ? "success" : "schedule"}`}>
+                          {account.status === "active" ? "启用" : "停用"}
+                        </span>
+                      </div>
+                      <p>
+                        {account.platform}
+                        {account.handle ? ` · ${account.handle}` : ""}
+                      </p>
+                      <div className="creator-account-meta">
+                        <span>{account.contentFocus || "未填写内容方向"}</span>
+                        <span>{account.audience || "未填写目标受众"}</span>
+                        <span>{account.tone || "未填写账号语气"}</span>
+                      </div>
+                    </div>
+                    <div className="creator-account-actions">
+                      <button className="text-button" onClick={() => openEdit(account)}>
+                        编辑
+                      </button>
+                      <button
+                        className="text-button"
+                        onClick={() =>
+                          void onStatusChange(
+                            account.id,
+                            account.status === "active" ? "paused" : "active",
+                          )
+                        }
+                      >
+                        {account.status === "active" ? "停用" : "启用"}
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="list-empty account-empty">
+                <AtSign size={20} />
+                <strong>{accounts.length ? "没有匹配的账号" : "还没有自媒体账号"}</strong>
+                <p>
+                  {accounts.length
+                    ? "清除筛选后查看全部账号。"
+                    : "先录入一个平台账号，后续内容项目和发布计划才能对应到具体账号。"}
+                </p>
+                <button className="text-button" onClick={accounts.length ? () => {
+                  setPlatform("全部");
+                  setStatus("全部");
+                } : openNew}>
+                  {accounts.length ? "清除筛选" : "新建账号"}
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+
+        {formOpen && (
+          <aside className="topic-draft creator-account-form-panel">
+            <div className="draft-header">
+              <div>
+                <p className="eyebrow">{editing ? "编辑账号" : "新建账号"}</p>
+                <h2>{editing?.displayName || "账号资料"}</h2>
+              </div>
+              <button
+                className="icon-button quiet"
+                onClick={() => {
+                  setFormOpen(false);
+                  setEditing(null);
+                  setDraft(blankDraft);
+                }}
+                aria-label="关闭账号表单"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <form className="topic-form creator-account-form" onSubmit={submit}>
+              <label>
+                平台
+                <select
+                  value={draft.platform}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      platform: event.target.value as Platform,
+                    }))
+                  }
+                >
+                  {platforms.map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                账号名称
+                <input
+                  value={draft.displayName}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      displayName: event.target.value,
+                    }))
+                  }
+                  placeholder="例如：Cato 内容研究所"
+                  maxLength={80}
+                  required
+                />
+              </label>
+              <label>
+                账号 ID
+                <input
+                  value={draft.handle}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      handle: event.target.value,
+                    }))
+                  }
+                  placeholder="例如：@cato-content"
+                  maxLength={120}
+                />
+              </label>
+              <label>
+                内容方向
+                <textarea
+                  value={draft.contentFocus}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      contentFocus: event.target.value,
+                    }))
+                  }
+                  placeholder="这个账号主要写什么"
+                  maxLength={200}
+                />
+              </label>
+              <label>
+                目标受众
+                <textarea
+                  value={draft.audience}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      audience: event.target.value,
+                    }))
+                  }
+                  placeholder="给谁看"
+                  maxLength={200}
+                />
+              </label>
+              <label>
+                账号语气
+                <input
+                  value={draft.tone}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      tone: event.target.value,
+                    }))
+                  }
+                  placeholder="例如：直接、专业、少口号"
+                  maxLength={120}
+                />
+              </label>
+              <label>
+                状态
+                <select
+                  value={draft.status}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      status: event.target.value as CreatorAccountStatus,
+                    }))
+                  }
+                >
+                  <option value="active">启用</option>
+                  <option value="paused">停用</option>
+                </select>
+              </label>
+              <label>
+                备注
+                <textarea
+                  value={draft.notes}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      notes: event.target.value,
+                    }))
+                  }
+                  placeholder="平台限制、选题边界、禁用词等"
+                  maxLength={2000}
+                />
+              </label>
+              <div className="panel-actions">
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => {
+                    setFormOpen(false);
+                    setEditing(null);
+                    setDraft(blankDraft);
+                  }}
+                >
+                  取消
+                </button>
+                <button className="primary-button" disabled={isSaving}>
+                  {isSaving ? "保存中" : "保存账号"}
+                </button>
+              </div>
+            </form>
+          </aside>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function PersonalSettingsView({
+  user,
+  onUserChange,
+  onLogout,
+  onNotice,
+}: {
+  user: WorkspaceUser;
+  onUserChange: (user: WorkspaceUser) => void;
+  onLogout: () => void;
+  onNotice: (message: string) => void;
+}) {
+  const [displayName, setDisplayName] = useState(user.displayName);
+  const [email, setEmail] = useState(user.email);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [passwordCurrent, setPasswordCurrent] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [profileNotice, setProfileNotice] = useState("");
+  const [passwordNotice, setPasswordNotice] = useState("");
+  const [isProfileSaving, setIsProfileSaving] = useState(false);
+  const [isPasswordSaving, setIsPasswordSaving] = useState(false);
+
+  useEffect(() => {
+    setDisplayName(user.displayName);
+    setEmail(user.email);
+  }, [user.displayName, user.email]);
+
+  const isProfileEmailChanged =
+    email.trim().toLowerCase() !== user.email.toLowerCase();
+
+  const saveAccount = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nextDisplayName = displayName.trim();
+    const nextEmail = email.trim().toLowerCase();
+    setProfileNotice("");
+    if (!nextDisplayName || nextDisplayName.length > 80) {
+      setProfileNotice("请输入 1 至 80 个字符的姓名。");
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(nextEmail)) {
+      setProfileNotice("请输入有效的邮箱地址。");
+      return;
+    }
+    setIsProfileSaving(true);
+    try {
+      const response = await fetch("/api/account", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          displayName: nextDisplayName,
+          email: nextEmail,
+          currentPassword: isProfileEmailChanged ? currentPassword : "",
+        }),
+      });
+      const data = (await response.json()) as {
+        user?: WorkspaceUser;
+        error?: string;
+      };
+      if (!response.ok || !data.user)
+        throw new Error(data.error || "账号资料保存失败。");
+      onUserChange(data.user);
+      setCurrentPassword("");
+      setProfileNotice("已保存账号资料。");
+      onNotice("已保存账号资料。");
+    } catch (error) {
+      setProfileNotice(
+        error instanceof Error ? error.message : "账号资料保存失败。",
+      );
+    } finally {
+      setIsProfileSaving(false);
+    }
+  };
+
+  const changePassword = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setPasswordNotice("");
+    if (!passwordCurrent) {
+      setPasswordNotice("请输入当前密码。");
+      return;
+    }
+    if (!newPassword) {
+      setPasswordNotice("请输入新密码。");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordNotice("两次输入的新密码不一致。");
+      return;
+    }
+    setIsPasswordSaving(true);
+    try {
+      const response = await fetch("/api/account", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          displayName: user.displayName,
+          email: user.email,
+          currentPassword: passwordCurrent,
+          newPassword,
+        }),
+      });
+      const data = (await response.json()) as {
+        user?: WorkspaceUser;
+        error?: string;
+      };
+      if (!response.ok || !data.user)
+        throw new Error(data.error || "密码修改失败。");
+      onUserChange(data.user);
+      setPasswordCurrent("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setPasswordNotice("密码已修改。其他设备上的旧会话已失效。");
+      onNotice("密码已修改。");
+    } catch (error) {
+      setPasswordNotice(error instanceof Error ? error.message : "密码修改失败。");
+    } finally {
+      setIsPasswordSaving(false);
+    }
+  };
+
+  return (
+    <div className="account-view">
+      <section className="page-heading">
+        <div>
+          <p className="eyebrow">本地工作区</p>
+          <h1>个人设置</h1>
+          <p className="page-summary">
+            管理当前登录账号、邮箱和密码。
+          </p>
+        </div>
+        <button className="text-button account-logout" onClick={() => void onLogout()}>
+          <LogOut size={15} />
+          退出登录
+        </button>
+      </section>
+
+      <div className="account-layout">
+        <section className="work-section account-card" aria-labelledby="account-profile-title">
+          <div className="section-heading">
+            <div>
+              <h2 id="account-profile-title">账号资料</h2>
+              <p>姓名会显示在侧栏和资料库更新记录中。</p>
+            </div>
+            <UserRound size={18} strokeWidth={1.8} />
+          </div>
+          <form className="account-form" onSubmit={saveAccount}>
+            <label>
+              姓名
+              <input
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                autoComplete="name"
+                maxLength={80}
+                required
+              />
+            </label>
+            <label>
+              邮箱
+              <input
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                autoComplete="email"
+                inputMode="email"
+                maxLength={254}
+                required
+              />
+            </label>
+            {isProfileEmailChanged && (
+              <label>
+                当前密码
+                <input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                  autoComplete="off"
+                  placeholder="确认邮箱修改"
+                  required
+                />
+              </label>
+            )}
+            <div className="account-actions">
+              <p role={profileNotice ? "status" : undefined}>{profileNotice}</p>
+              <button className="primary-button" disabled={isProfileSaving}>
+                <Save size={15} />
+                {isProfileSaving ? "保存中" : "保存资料"}
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section className="work-section account-card" aria-labelledby="account-password-title">
+          <div className="section-heading">
+            <div>
+              <h2 id="account-password-title">修改密码</h2>
+              <p>保存后，其他设备上的旧登录会失效。</p>
+            </div>
+            <KeyRound size={18} strokeWidth={1.8} />
+          </div>
+          <form className="account-form" onSubmit={changePassword}>
+            <label>
+              当前密码
+              <input
+                type="password"
+                value={passwordCurrent}
+                onChange={(event) => setPasswordCurrent(event.target.value)}
+                autoComplete="current-password"
+                required
+              />
+            </label>
+            <label>
+              新密码
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                autoComplete="new-password"
+                maxLength={256}
+                required
+              />
+            </label>
+            <label>
+              确认新密码
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+                maxLength={256}
+                required
+              />
+            </label>
+            <div className="account-actions">
+              <p role={passwordNotice ? "status" : undefined}>{passwordNotice}</p>
+              <button className="primary-button" disabled={isPasswordSaving}>
+                <KeyRound size={15} />
+                {isPasswordSaving ? "修改中" : "修改密码"}
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function formatClock(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 function TodayView({
@@ -2075,6 +3217,12 @@ function IntelligenceView({
   onSaveEvidence,
   onDeleteEvidence,
   onArchiveEvidence,
+  transcriptCapabilities,
+  onExtractFromUrl,
+  onRefreshTranscript,
+  onInstallTranscriptEngine,
+  onInstallWhisperModel,
+  onRecheckTranscriptCapabilities,
   seedItemId,
   onSeedHandled,
   searchRequest,
@@ -2089,6 +3237,14 @@ function IntelligenceView({
   onSaveEvidence: (evidence: EvidenceDraft) => Promise<boolean>;
   onDeleteEvidence: (evidenceId: string) => Promise<boolean>;
   onArchiveEvidence: (evidenceId: string) => Promise<boolean>;
+  transcriptCapabilities: TranscriptCapabilities | null;
+  onExtractFromUrl: (sourceUrl: string) => Promise<LinkExtractOutcome>;
+  onRefreshTranscript: (
+    evidenceId: string,
+  ) => Promise<(TranscriptOutcome & { text: string }) | null>;
+  onInstallTranscriptEngine: () => Promise<boolean>;
+  onInstallWhisperModel: (size?: string) => Promise<boolean>;
+  onRecheckTranscriptCapabilities: () => Promise<boolean>;
   seedItemId: string | null;
   onSeedHandled: () => void;
   searchRequest: { query: string; id: number } | null;
@@ -2099,6 +3255,7 @@ function IntelligenceView({
   const [draftOpen, setDraftOpen] = useState(false);
   const [captureOpen, setCaptureOpen] = useState(false);
   const [crawlerOpen, setCrawlerOpen] = useState(false);
+  const [linkExtractOpen, setLinkExtractOpen] = useState(false);
   const [expandedSourceId, setExpandedSourceId] = useState<string | null>(null);
   const [previewItem, setPreviewItem] = useState<IntelligenceItem | null>(null);
   const [detailItem, setDetailItem] = useState<IntelligenceItem | null>(null);
@@ -2123,6 +3280,7 @@ function IntelligenceView({
     draftOpen ||
     captureOpen ||
     crawlerOpen ||
+    linkExtractOpen ||
     previewItem !== null ||
     detailItem !== null;
   const toggleSelected = (id: string) =>
@@ -2175,12 +3333,14 @@ function IntelligenceView({
     setPreviewItem(null);
     setCrawlerOpen(false);
     setCaptureOpen(false);
+    setLinkExtractOpen(false);
     setDraftOpen(true);
   };
   const openDetail = (item: IntelligenceItem) => {
     setDraftOpen(false);
     setCaptureOpen(false);
     setCrawlerOpen(false);
+    setLinkExtractOpen(false);
     setPreviewItem(null);
     setDetailItem(item);
   };
@@ -2189,6 +3349,7 @@ function IntelligenceView({
     setDraftOpen(false);
     setCaptureOpen(false);
     setCrawlerOpen(false);
+    setLinkExtractOpen(false);
     setPreviewItem(item);
   };
   useEffect(() => {
@@ -2198,11 +3359,12 @@ function IntelligenceView({
       else if (previewItem) setPreviewItem(null);
       else if (draftOpen) setDraftOpen(false);
       else if (captureOpen) setCaptureOpen(false);
+      else if (linkExtractOpen) setLinkExtractOpen(false);
       else if (crawlerOpen) setCrawlerOpen(false);
     };
     window.addEventListener("keydown", closePanel);
     return () => window.removeEventListener("keydown", closePanel);
-  }, [captureOpen, crawlerOpen, detailItem, draftOpen, previewItem]);
+  }, [captureOpen, crawlerOpen, detailItem, draftOpen, linkExtractOpen, previewItem]);
   useEffect(() => {
     if (!seedItemId || !items.some((item) => item.id === seedItemId)) return;
     setSelected((current) =>
@@ -2215,6 +3377,13 @@ function IntelligenceView({
     setPlatform("全部");
     setQuery(searchRequest.query);
   }, [searchRequest]);
+  // 详情面板持有的是快照。逐字稿重新提取后 sources 会更新，
+  // 这里把面板同步到最新对象，否则用户看到的还是旧内容。
+  useEffect(() => {
+    if (!detailItem) return;
+    const latest = items.find((item) => item.id === detailItem.id);
+    if (latest && latest !== detailItem) setDetailItem(latest);
+  }, [detailItem, items]);
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!topicTitle.trim() || selected.length === 0) return;
@@ -2246,6 +3415,21 @@ function IntelligenceView({
               setPreviewItem(null);
               setDraftOpen(false);
               setCrawlerOpen(false);
+              setCaptureOpen(false);
+              setLinkExtractOpen(true);
+            }}
+          >
+            <Link2 size={16} />
+            从链接提取
+          </button>
+          <button
+            className="text-button"
+            onClick={() => {
+              setDetailItem(null);
+              setPreviewItem(null);
+              setDraftOpen(false);
+              setCrawlerOpen(false);
+              setLinkExtractOpen(false);
               setCaptureOpen(true);
             }}
           >
@@ -2259,6 +3443,7 @@ function IntelligenceView({
               setPreviewItem(null);
               setDraftOpen(false);
               setCaptureOpen(false);
+              setLinkExtractOpen(false);
               setCrawlerOpen(true);
             }}
           >
@@ -2475,17 +3660,37 @@ function IntelligenceView({
           ) : (
             <div className="list-empty">
               <Search size={20} />
-              <strong>没有找到匹配内容</strong>
-              <p>试试更短的关键词，或清除筛选条件。</p>
-              <button
-                className="text-button"
-                onClick={() => {
-                  setQuery("");
-                  setPlatform("全部");
-                }}
-              >
-                清除筛选
-              </button>
+              {/* 空库与「筛掉了」是两种完全不同的处境：
+                  前者该引导去采集，后者该引导去清除条件。 */}
+              {items.length === 0 ? (
+                <>
+                  <strong>还没有内容情报</strong>
+                  <p>
+                    粘贴一条视频链接即可提取标题与口播逐字稿；也可以采集平台内容或手动录入。
+                  </p>
+                  <button
+                    className="text-button"
+                    onClick={() => setLinkExtractOpen(true)}
+                  >
+                    <Link2 size={14} />
+                    从链接提取
+                  </button>
+                </>
+              ) : (
+                <>
+                  <strong>没有找到匹配内容</strong>
+                  <p>试试更短的关键词，或清除筛选条件。</p>
+                  <button
+                    className="text-button"
+                    onClick={() => {
+                      setQuery("");
+                      setPlatform("全部");
+                    }}
+                  >
+                    清除筛选
+                  </button>
+                </>
+              )}
             </div>
           )}
         </section>
@@ -2553,6 +3758,15 @@ function IntelligenceView({
             onSave={onSaveEvidence}
           />
         )}
+        {linkExtractOpen && (
+          <LinkExtractPanel
+            capabilities={transcriptCapabilities}
+            onClose={() => setLinkExtractOpen(false)}
+            onExtract={onExtractFromUrl}
+            onInstallEngine={onInstallTranscriptEngine}
+            onInstallModel={onInstallWhisperModel}
+          />
+        )}
         {crawlerOpen && (
           <MediaCrawlerPanel
             connector={connector}
@@ -2575,6 +3789,7 @@ function IntelligenceView({
             item={detailItem}
             onClose={() => setDetailItem(null)}
             onPreview={() => openPreview(detailItem)}
+            onRefreshTranscript={() => onRefreshTranscript(detailItem.id)}
           />
         )}
       </div>
@@ -2921,12 +4136,16 @@ function AssetsView({
   onOpenIntelligence,
   onCreateTopicFromAsset,
   onArchiveEvidence,
+  onRefreshTranscript,
 }: {
   items: IntelligenceItem[];
   isLoading: boolean;
   onOpenIntelligence: () => void;
   onCreateTopicFromAsset: (itemId: string) => void;
   onArchiveEvidence: (itemId: string) => Promise<boolean>;
+  onRefreshTranscript: (
+    itemId: string,
+  ) => Promise<(TranscriptOutcome & { text: string }) | null>;
 }) {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query.trim());
@@ -3142,6 +4361,7 @@ function AssetsView({
             images={selectedImages}
             displayedImage={imageToDisplay}
             onSelectImage={setSelectedImage}
+            onRefreshTranscript={() => onRefreshTranscript(selectedItem.id)}
             onArchive={async () => {
               const archived = await onArchiveEvidence(selectedItem.id);
               if (archived) {
@@ -3303,6 +4523,7 @@ function AssetInspector({
   images,
   displayedImage,
   onSelectImage,
+  onRefreshTranscript,
   onArchive,
   onCreateTopic,
   onClose,
@@ -3311,6 +4532,7 @@ function AssetInspector({
   images: string[];
   displayedImage: string;
   onSelectImage: (url: string) => void;
+  onRefreshTranscript: () => Promise<(TranscriptOutcome & { text: string }) | null>;
   onArchive: () => Promise<void>;
   onCreateTopic: () => void;
   onClose: () => void;
@@ -3318,6 +4540,26 @@ function AssetInspector({
   const hasDistinctBody =
     Boolean(item.body.trim()) && item.body.trim() !== item.summary.trim();
   const body = item.body || item.summary || "原始正文暂不可用。";
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const showTranscript =
+    Boolean(item.transcript) ||
+    Boolean(item.sourceUrl) ||
+    item.transcriptStatus !== "not_requested";
+  const refresh = async () => {
+    setIsRefreshing(true);
+    await onRefreshTranscript();
+    setIsRefreshing(false);
+  };
+  const copyTranscript = async () => {
+    if (!item.transcript) return;
+    try {
+      await navigator.clipboard.writeText(item.transcript);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
   return (
     <aside className="asset-inspector" aria-label={`查看素材 ${item.title}`}>
       <div className="draft-header">
@@ -3374,15 +4616,54 @@ function AssetInspector({
         <h3>{item.platform === "抖音" ? "发布文案" : hasDistinctBody ? "完整正文" : "正文"}</h3>
         <p>{body}</p>
       </section>
-      {item.platform === "抖音" && (
+      {showTranscript && (
         <section className="asset-copy transcript-copy">
-          <h3>口播逐字稿</h3>
-          <p>
-            {item.transcript ||
-              (item.transcriptStatus === "not_configured"
-                ? "未配置本机转写引擎。"
-                : "尚未请求转写。")}
-          </p>
+          <div className="content-transcript-head">
+            <h3>口播逐字稿</h3>
+            <span className={`transcript-badge is-${item.transcriptStatus}`}>
+              {transcriptStatusLabel[item.transcriptStatus]}
+            </span>
+          </div>
+          {item.transcript ? (
+            <div className="transcript-scroll">
+              <p>{item.transcript}</p>
+            </div>
+          ) : (
+            <p className="extract-note">
+              {item.transcriptStatus === "not_configured"
+                ? "本机未配置转写引擎。"
+                : item.transcriptStatus === "failed"
+                  ? "上次提取未成功，可以重试。"
+                  : "尚未提取。可在内容情报页用「从链接提取」补齐。"}
+            </p>
+          )}
+          <div className="panel-actions">
+            {item.transcript && (
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void copyTranscript()}
+              >
+                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? "已复制" : "复制"}
+              </button>
+            )}
+            {item.sourceUrl && (
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void refresh()}
+                disabled={isRefreshing}
+              >
+                <RotateCcw size={14} />
+                {isRefreshing
+                  ? "正在提取"
+                  : item.transcript
+                    ? "重新提取"
+                    : "提取逐字稿"}
+              </button>
+            )}
+          </div>
         </section>
       )}
       <div className="panel-actions">
@@ -3507,12 +4788,35 @@ function ContentDetailPanel({
   item,
   onClose,
   onPreview,
+  onRefreshTranscript,
 }: {
   item: IntelligenceItem;
   onClose: () => void;
   onPreview: () => void;
+  onRefreshTranscript: () => Promise<(TranscriptOutcome & { text: string }) | null>;
 }) {
   const imageCount = item.imageUrls.length || Number(Boolean(item.coverUrl));
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const showTranscript =
+    Boolean(item.transcript) ||
+    Boolean(item.sourceUrl) ||
+    (item.transcriptStatus !== "not_requested" &&
+      item.transcriptStatus !== undefined);
+  const refresh = async () => {
+    setIsRefreshing(true);
+    await onRefreshTranscript();
+    setIsRefreshing(false);
+  };
+  const copyTranscript = async () => {
+    if (!item.transcript) return;
+    try {
+      await navigator.clipboard.writeText(item.transcript);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
   return (
     <aside
       className="topic-draft content-detail"
@@ -3538,15 +4842,59 @@ function ContentDetailPanel({
         <span>{item.collectedAt}</span>
       </div>
       <p className="content-detail-body">{item.body || item.summary}</p>
-      {item.platform === "抖音" && (
-        <section className="content-transcript-status">
-          <strong>口播逐字稿</strong>
-          <span>
-            {item.transcript ||
-              (item.transcriptStatus === "not_configured"
-                ? "未配置本机转写引擎"
-                : "尚未请求转写")}
-          </span>
+      {showTranscript && (
+        <section className="content-transcript">
+          <div className="content-transcript-head">
+            <strong>口播逐字稿</strong>
+            <span className={`transcript-badge is-${item.transcriptStatus}`}>
+              {transcriptStatusLabel[item.transcriptStatus]}
+            </span>
+          </div>
+          {item.transcript ? (
+            <>
+              <div className="transcript-scroll">
+                <p>{item.transcript}</p>
+              </div>
+              <p className="transcript-count">
+                {Array.from(item.transcript).length} 字
+              </p>
+            </>
+          ) : (
+            <p className="extract-note">
+              {item.transcriptStatus === "not_configured"
+                ? "本机未配置转写引擎，无法从这条素材提取口播文案。"
+                : item.transcriptStatus === "failed"
+                  ? "上次提取未成功，可以重试。"
+                  : "尚未提取口播逐字稿。"}
+            </p>
+          )}
+          <div className="panel-actions">
+            {item.transcript && (
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void copyTranscript()}
+              >
+                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? "已复制" : "复制"}
+              </button>
+            )}
+            {item.sourceUrl && (
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void refresh()}
+                disabled={isRefreshing}
+              >
+                <RotateCcw size={14} />
+                {isRefreshing
+                  ? "正在提取"
+                  : item.transcript
+                    ? "重新提取"
+                    : "提取逐字稿"}
+              </button>
+            )}
+          </div>
         </section>
       )}
       <div className="panel-actions">
@@ -3570,6 +4918,267 @@ function ContentDetailPanel({
           完成
         </button>
       </div>
+    </aside>
+  );
+}
+
+/**
+ * 从链接提取文案。
+ * 与「采集内容」的区别：它不依赖 MediaCrawler 与平台登录态，
+ * 只走 yt-dlp 解析 + 原生字幕（或 ASR）这一条独立链路。
+ */
+function LinkExtractPanel({
+  capabilities,
+  onClose,
+  onExtract,
+  onInstallEngine,
+  onInstallModel,
+}: {
+  capabilities: TranscriptCapabilities | null;
+  onClose: () => void;
+  onExtract: (sourceUrl: string) => Promise<LinkExtractOutcome>;
+  onInstallEngine: () => Promise<boolean>;
+  onInstallModel: (size?: string) => Promise<boolean>;
+}) {
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [isInstalling, setIsInstalling] = useState(false);
+  const [isFetchingModel, setIsFetchingModel] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [result, setResult] = useState<LinkExtractOutcome | null>(null);
+  const mode = capabilities?.mode ?? "unavailable";
+  const modeLabel =
+    mode === "full"
+      ? "原生字幕 + 语音识别"
+      : mode === "subtitle_only"
+        ? "仅原生字幕"
+        : "未就绪";
+  const success = result?.ok ? result : null;
+  const failure = result && !result.ok ? result : null;
+  const transcriptOutcome = result?.ok
+    ? result.transcript
+    : (failure?.transcript ?? null);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const url = sourceUrl.trim();
+    if (!url || isExtracting) return;
+    setCopied(false);
+    setIsExtracting(true);
+    setResult(null);
+    const outcome = await onExtract(url);
+    setResult(outcome);
+    setIsExtracting(false);
+  };
+  const install = async () => {
+    setIsInstalling(true);
+    await onInstallEngine();
+    setIsInstalling(false);
+  };
+  const fetchModel = async () => {
+    setIsFetchingModel(true);
+    await onInstallModel("small");
+    setIsFetchingModel(false);
+  };
+  const copyTranscript = async () => {
+    const text = success?.item.transcript;
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+  // 面板可能比视口高，提取结束后把结果滚进视野，
+  // 否则用户点了按钮却看不到任何变化。
+  const resultRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!result) return;
+    resultRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [result]);
+  return (
+    <aside
+      className="topic-draft link-extract-panel"
+      aria-label="从链接提取文案"
+    >
+      <div className="draft-header">
+        <div>
+          <p className="eyebrow">内容情报</p>
+          <h2>从链接提取</h2>
+        </div>
+        <button
+          className="icon-button quiet"
+          onClick={onClose}
+          aria-label="关闭提取面板"
+        >
+          <X size={18} />
+        </button>
+      </div>
+      <p className="link-extract-intro">
+        粘贴一条视频链接，抓取标题、作者与封面，并尽量取得口播逐字稿。
+        这条链路不依赖平台登录态。
+      </p>
+
+      <div className="connector-status">
+        <span
+          className={`status-dot ${mode === "full" ? "success" : mode === "subtitle_only" ? "review" : "schedule"}`}
+          aria-hidden="true"
+        />
+        <div>
+          <strong>转写引擎 · {modeLabel}</strong>
+          <p>
+            {capabilities
+              ? capabilities.hint || "本机引擎齐备，可直接提取。"
+              : "正在检测本机转写能力。"}
+          </p>
+        </div>
+      </div>
+
+      {capabilities && (
+        <ul className="engine-list" aria-label="本机转写引擎状态">
+          {[capabilities.ytdlp, capabilities.ffmpeg, capabilities.asr].map(
+            (engine) => (
+              <li key={engine.id} className={engine.available ? "is-ready" : ""}>
+                <span className="engine-name">{engine.label}</span>
+                <span className="engine-state">
+                  {engine.available
+                    ? engine.version || "已就绪"
+                    : engine.path
+                      ? engine.missingModel
+                        ? "缺模型"
+                        : "不完整"
+                      : "未安装"}
+                </span>
+                <span className="engine-purpose">
+                  {engine.missingModel
+                    ? "需要 ggml 模型文件，执行 npm run transcript -- model 下载。"
+                    : engine.purpose}
+                </span>
+              </li>
+            ),
+          )}
+        </ul>
+      )}
+
+      {mode === "unavailable" && (
+        <div className="connector-empty">
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => void install()}
+            disabled={isInstalling}
+          >
+            {isInstalling ? "正在安装" : "安装解析引擎 yt-dlp"}
+          </button>
+          <p>下载到项目本地 .tools/ 目录，不改动系统环境。</p>
+        </div>
+      )}
+
+      {mode === "subtitle_only" && capabilities?.asr?.missingModel && (
+        <div className="connector-empty">
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => void fetchModel()}
+            disabled={isFetchingModel}
+          >
+            {isFetchingModel ? "正在下载模型" : "下载语音模型 small（推荐）"}
+          </button>
+          <p>
+            约 490 MB，装到 .tools/models/。只有视频没有原生字幕时才会用到它。
+            中文口播建议用这一档——实测比 base 明显更准，「逐字稿」「链接」这类
+            常用词都能正确落字。想省时间可改用 base（约 150 MB），代价是错字偏多。
+          </p>
+        </div>
+      )}
+
+      <form className="topic-form link-extract-form" onSubmit={submit}>
+        <label>
+          <span>视频链接</span>
+          <input
+            value={sourceUrl}
+            onChange={(event) => setSourceUrl(event.target.value)}
+            placeholder="https://v.douyin.com/… 或 https://www.bilibili.com/video/…"
+            inputMode="url"
+            autoComplete="off"
+            disabled={isExtracting}
+          />
+        </label>
+        <div className="panel-actions">
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={!sourceUrl.trim() || isExtracting}
+          >
+            {isExtracting ? "正在提取" : "提取文案"}
+            {!isExtracting && <ArrowUpRight size={14} />}
+          </button>
+        </div>
+      </form>
+
+      {transcriptOutcome && (
+        <ol className="extract-stages" aria-label="提取阶段">
+          {transcriptOutcome.stages.map((stage, index) => (
+            <li key={`${stage.stage}-${index}`} data-status={stage.status}>
+              <span className="stage-name">{stage.stage}</span>
+              <span className="stage-detail">{stage.detail}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {success && (
+        <div className="extract-result" ref={resultRef}>
+          <p className="eyebrow">{success.created ? "已新增情报" : "已更新情报"}</p>
+          <h3>{success.item.title}</h3>
+          <div className="preview-meta">
+            <span>{success.item.platform}</span>
+            <span>{success.item.author}</span>
+            <span>{success.item.signal}</span>
+          </div>
+          {success.transcript.status === "succeeded" ? (
+            <>
+              <div className="extract-result-head">
+                <strong>
+                  逐字稿 {success.transcript.chars} 字
+                  {success.transcript.source
+                    ? ` · ${success.transcript.source}`
+                    : ""}
+                  {success.transcript.language
+                    ? ` · ${success.transcript.language}`
+                    : ""}
+                </strong>
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => void copyTranscript()}
+                >
+                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                  {copied ? "已复制" : "复制"}
+                </button>
+              </div>
+              <div className="transcript-scroll">
+                <p>{success.item.transcript}</p>
+              </div>
+            </>
+          ) : (
+            <p className="extract-note">
+              已导入素材，但没有取到逐字稿。
+              {transcriptOutcome?.error || transcriptOutcome?.hint || ""}
+            </p>
+          )}
+        </div>
+      )}
+
+      {failure && (
+        <div className="extract-result extract-failure" ref={resultRef}>
+          <p className="eyebrow">未能提取</p>
+          <p className="extract-note">{failure.error}</p>
+          {transcriptOutcome?.hint && (
+            <p className="extract-hint">{transcriptOutcome.hint}</p>
+          )}
+        </div>
+      )}
     </aside>
   );
 }
